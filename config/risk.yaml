@@ -1,0 +1,14 @@
+mode: paper_only
+max_dollars_per_trade: 100
+max_trades_per_day: 3
+max_alert_age_seconds: 20
+allow_market_orders: false
+allow_after_hours: false
+allow_options: false
+option_manual_approval_only: true
+allow_short_selling: false
+require_stop_loss: true
+require_target: false
+duplicate_trade_window_minutes: 60
+max_same_ticker_open_trades: 1
+fail_closed: true

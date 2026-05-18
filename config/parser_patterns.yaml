@@ -1,0 +1,16 @@
+allow_options: true
+allow_stocks: true
+require_stop_loss: true
+default_time_in_force: day
+default_option_expiration_year: auto
+ticker_allowlist: []
+ticker_blocklist: []
+ambiguous_phrases:
+  - watching
+  - could take
+  - maybe
+  - looking at
+  - possible
+  - idea
+  - lotto
+  - risky

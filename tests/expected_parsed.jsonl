@@ -1,0 +1,4 @@
+{"ticker":"TSLA","side":"buy","entry_price":182.5,"stop_price":179.8,"target_price":188.0}
+{"ticker":"AAPL","side":"buy","entry_price":198.5,"stop_price":196.2,"target_price":203.0}
+{"ticker":"NVDA","side":"short","entry_price":910.0,"stop_price":922.0,"target_price":880.0}
+{"ticker":"MSFT","side":"buy","entry_price":420.0,"stop_price":416.0,"target_price":430.0}

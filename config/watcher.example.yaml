@@ -1,0 +1,31 @@
+app_names:
+  - Discord
+bundle_ids:
+  - com.hnc.Discord
+alert_author_names:
+  - OTWSteve
+  - SteveOTWS
+alert_channel_ids:
+  - "replace_with_discord_channel_id"
+watchlist_channel_ids: []
+require_alert_channel_id_match: false
+title_keywords:
+  - Trading
+  - Traders
+  - Alert
+  - Stock
+body_keywords:
+  - BUY
+  - SELL
+  - LONG
+  - SHORT
+  - CALL
+  - PUT
+  - STOP
+  - TARGET
+poll_interval_seconds: 1
+option_track_interval_seconds: 15
+dedupe_window_minutes: 60
+write_all_discord_notifications: false
+timezone: America/Detroit
+capture_method: auto

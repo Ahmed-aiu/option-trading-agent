@@ -1,0 +1,2 @@
+{"event_type":"raw_discord_notification","captured_at":"2026-05-08T14:00:00-04:00","notification_timestamp":"","source_app":"Discord","bundle_id":"com.hnc.Discord","title":"General","subtitle":"chat","body":"Nice move on AMD","raw":{},"dedupe_key":"noise-001"}
+{"event_type":"raw_discord_notification","captured_at":"2026-05-08T14:01:00-04:00","notification_timestamp":"","source_app":"Discord","bundle_id":"com.hnc.Discord","title":"General","subtitle":"chat","body":"NVDA looks strong","raw":{},"dedupe_key":"noise-002"}

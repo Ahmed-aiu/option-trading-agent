@@ -1,0 +1,13 @@
+broker: alpaca
+mode: paper
+paper_base_url: https://paper-api.alpaca.markets
+refuse_live_endpoint: true
+submit_enabled_env_var: OPENCLAW_ENABLE_PAPER_ORDERS
+trading_mode_env_var: OPENCLAW_TRADING_MODE
+key_id_env_var: APCA_API_KEY_ID
+secret_key_env_var: APCA_API_SECRET_KEY
+base_url_env_var: APCA_API_BASE_URL
+client_order_id_prefix: openclaw-paper
+use_fractional_qty_for_limit_orders: true
+qty_precision: 6
+append_order_audit: true
