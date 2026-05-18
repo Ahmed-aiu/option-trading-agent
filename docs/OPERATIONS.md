@@ -58,7 +58,7 @@ scripts/uninstall_launch_agent.sh
 ```text
 skip
 buy
-buy contracts=1 stop=35 take=80
+buy contracts=1 stop=35% take=80%
 buy contracts=1 stop_price=3.80 take_price=6.20
 ```
 

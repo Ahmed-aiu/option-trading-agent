@@ -197,7 +197,7 @@ The live pipeline sends approval cards for parsed Steve-style option alerts and 
 ```text
 skip
 buy
-buy contracts=1 stop=35 take=80
+buy contracts=1 stop=35% take=80%
 buy contracts=1 stop_price=3.80 take_price=6.20
 ```
 

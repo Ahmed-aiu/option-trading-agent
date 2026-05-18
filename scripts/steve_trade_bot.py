@@ -255,6 +255,10 @@ def dynamic_price_command_example(alert: dict[str, Any], snapshot: dict[str, Any
     return f"buy contracts=1 stop_price={stop_price:.2f} take_price={take_price:.2f}"
 
 
+def percent_value(value: float) -> str:
+    return f"{value:g}%"
+
+
 def exit_plan_for_contracts(
     contracts: int,
     entry_price: float | None = None,
@@ -303,7 +307,7 @@ def approval_message(alert: dict[str, Any], snapshot: dict[str, Any], approval_i
             "Reply:",
             "skip",
             "buy",
-            f"buy contracts=1 stop={DEFAULT_STOP_PERCENT:g} take={DEFAULT_TAKE_PERCENT:g}",
+            f"buy contracts=1 stop={percent_value(DEFAULT_STOP_PERCENT)} take={percent_value(DEFAULT_TAKE_PERCENT)}",
             dynamic_price_command_example(alert, snapshot),
         ]
     )

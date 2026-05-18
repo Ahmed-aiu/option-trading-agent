@@ -114,6 +114,7 @@ def test_validation_and_approval() -> None:
         assert cards[0]["status"] == "telegram_disabled"
         assert cards[0]["message_text"].startswith("Alert: #CRWV MAY 8 113 call @ .88 Bought 10")
         assert "\nbuy\n" in cards[0]["message_text"]
+        assert "buy contracts=1 stop=35% take=80%" in cards[0]["message_text"]
         cards[0]["telegram_message_id"] = 100
         steve_trade_bot.APPROVAL_CARDS_FILE.write_text(json.dumps(cards[0], sort_keys=True) + "\n", encoding="utf-8")
 
@@ -124,6 +125,10 @@ def test_validation_and_approval() -> None:
         assert default_buy["take_percent"] == 80.0
         assert default_buy["used_default_contracts"] is True
         assert default_buy["used_default_risk"] is True
+        percent_buy = steve_trade_bot.parse_approval_command("buy contracts=1 stop=35% take=80%")
+        assert percent_buy["ok"] is True
+        assert percent_buy["stop_percent"] == 35.0
+        assert percent_buy["take_percent"] == 80.0
 
         config = steve_trade_bot.BotConfig(
             token="test",
