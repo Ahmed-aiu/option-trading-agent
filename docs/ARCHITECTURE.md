@@ -58,6 +58,7 @@ Core ledgers:
 - `steve_option_exits.jsonl`: parsed Steve closes matched to shadow positions.
 - `steve_approval_cards.jsonl`: Telegram card audit.
 - `steve_approval_actions.jsonl`: Telegram reply audit.
+- `steve_close_reports.jsonl`: Telegram close-report audit.
 - `human_paper_positions.jsonl`: approved human paper entries.
 - `human_paper_exits.jsonl`: local paper exits from targets, stops, or Steve catch-up.
 - `orders_paper.jsonl`: Alpaca paper order attempts or blocked attempts.

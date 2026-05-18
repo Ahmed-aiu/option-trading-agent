@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import re
@@ -21,6 +22,7 @@ from pipeline_common import DATA_DIR, append_jsonl, now_iso, parse_datetime, rea
 
 APPROVAL_CARDS_FILE = DATA_DIR / "steve_approval_cards.jsonl"
 APPROVAL_ACTIONS_FILE = DATA_DIR / "steve_approval_actions.jsonl"
+CLOSE_REPORTS_FILE = DATA_DIR / "steve_close_reports.jsonl"
 HUMAN_POSITIONS_FILE = DATA_DIR / "human_paper_positions.jsonl"
 BOT_STATE_FILE = DATA_DIR / "steve_trade_bot_state.json"
 DEFAULT_STOP_PERCENT = 35.0
@@ -145,6 +147,126 @@ def configured_approval_chat_ids(config: BotConfig) -> tuple[str, ...]:
 
 def send_telegram_message(config: BotConfig, text: str, chat_id: str | None = None) -> dict[str, Any]:
     return telegram_request(config.token, "sendMessage", {"chat_id": chat_id or config.approval_chat_id, "text": text})
+
+
+def format_price(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def format_signed_pct(value: Any) -> str:
+    try:
+        return f"{float(value):+.1f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def format_signed_money(value: Any) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    sign = "+" if amount >= 0 else "-"
+    absolute = abs(amount)
+    if absolute >= 100 or absolute.is_integer():
+        return f"{sign}${absolute:,.0f}"
+    return f"{sign}${absolute:,.2f}"
+
+
+def option_exit_label(exit_record: dict[str, Any]) -> str:
+    ticker = str(exit_record.get("ticker") or "").upper()
+    expiration = exit_record.get("expiration_date")
+    strike = exit_record.get("strike_price")
+    option_type = str(exit_record.get("option_type") or "").lower()
+    if ticker and expiration and strike is not None and option_type:
+        try:
+            exp = dt.date.fromisoformat(str(expiration))
+            side = "C" if option_type.startswith("call") else "P"
+            strike_text = f"{float(strike):g}"
+            return f"{ticker} {exp:%b} {exp.day} {strike_text}{side}"
+        except (TypeError, ValueError):
+            pass
+    return str(exit_record.get("contract_symbol") or ticker or "OPTION")
+
+
+def close_reason_text(exit_record: dict[str, Any]) -> str:
+    reason = str(exit_record.get("reason") or "")
+    if reason == "take_profit":
+        take_percent = exit_record.get("take_percent")
+        return f"{float(take_percent):g}% target hit" if take_percent is not None else "target hit"
+    if reason == "stop_loss":
+        return "stop hit"
+    if reason == "steve_exit_catch_up":
+        return "Steve sold; catching up"
+    return reason.replace("_", " ") or "paper exit"
+
+
+def close_report_message(exit_record: dict[str, Any]) -> str:
+    remaining = int(exit_record.get("remaining_after_exit") or 0)
+    status = "CLOSED FULL" if remaining <= 0 else "CLOSED PARTIAL"
+    sold = int(exit_record.get("contracts") or 0)
+    total = int(exit_record.get("position_contracts") or sold + remaining)
+    return "\n".join(
+        [
+            status,
+            option_exit_label(exit_record),
+            f"Sold {sold}/{total} @ {format_price(exit_record.get('exit_price'))} ({format_signed_pct(exit_record.get('pnl_percent'))})",
+            f"P/L: {format_signed_money(exit_record.get('pnl_dollars'))} | Remain: {remaining}",
+            f"Reason: {close_reason_text(exit_record)}",
+        ]
+    )
+
+
+def send_human_exit_report(exit_record: dict[str, Any]) -> dict[str, Any]:
+    config = load_bot_config(required=False)
+    message = close_report_message(exit_record)
+    report = {
+        "event_type": "steve_close_report",
+        "exit_id": exit_record.get("exit_id"),
+        "position_id": exit_record.get("position_id"),
+        "approval_id": exit_record.get("approval_id"),
+        "created_at": now_iso(),
+        "status": "telegram_disabled",
+        "reason": "missing_steve_trade_bot_env",
+        "message_text": message,
+        "telegram_messages": [],
+    }
+    if config is not None:
+        messages: list[dict[str, Any]] = []
+        for chat_id in configured_approval_chat_ids(config):
+            try:
+                response = send_telegram_message(config, message, chat_id=chat_id)
+                if not response.get("ok"):
+                    raise RuntimeError(f"Telegram returned non-ok response: {response}")
+                result = response.get("result", {})
+                chat = result.get("chat") or {}
+                messages.append(
+                    {
+                        "chat_id": str(chat.get("id") if chat.get("id") is not None else chat_id),
+                        "message_id": result.get("message_id"),
+                        "status": "sent",
+                        "reason": "",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                messages.append({"chat_id": str(chat_id), "message_id": None, "status": "send_failed", "reason": str(exc)})
+        report["telegram_messages"] = messages
+        successes = [row for row in messages if row.get("status") == "sent"]
+        failures = [row for row in messages if row.get("status") != "sent"]
+        if successes:
+            report["status"] = "partial_sent" if failures else "sent"
+            report["reason"] = "; ".join(
+                f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
+            )
+        elif messages:
+            report["status"] = "send_failed"
+            report["reason"] = "; ".join(
+                f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
+            )
+    append_jsonl(CLOSE_REPORTS_FILE, report)
+    return report
 
 
 def load_state() -> dict[str, Any]:

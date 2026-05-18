@@ -58,6 +58,7 @@ def patch_runtime_paths(tmp_path: Path) -> None:
     option_validation.DAILY_SUMMARIES_FILE = tmp_path / "daily_option_summaries.jsonl"
     steve_trade_bot.APPROVAL_CARDS_FILE = tmp_path / "steve_approval_cards.jsonl"
     steve_trade_bot.APPROVAL_ACTIONS_FILE = tmp_path / "steve_approval_actions.jsonl"
+    steve_trade_bot.CLOSE_REPORTS_FILE = tmp_path / "steve_close_reports.jsonl"
     steve_trade_bot.HUMAN_POSITIONS_FILE = tmp_path / "human_paper_positions.jsonl"
     steve_trade_bot.BOT_STATE_FILE = tmp_path / "steve_trade_bot_state.json"
 
@@ -294,10 +295,67 @@ def test_multi_destination_approval_cards() -> None:
         assert group_skip["approval_id"] == card["approval_id"]
 
 
+def test_close_report_message_and_delivery() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        config = steve_trade_bot.BotConfig(
+            token="test",
+            approval_chat_id="123456789",
+            owner_chat_id="123456789",
+            owner_user_id="123456789",
+            approval_chat_ids=("123456789", "-1001234567890"),
+        )
+        steve_trade_bot.load_bot_config = lambda required=False: config
+        sent: list[tuple[str, str]] = []
+
+        def fake_send_message(config, text, chat_id=None):
+            sent.append((str(chat_id), text))
+            message_id = 31 if str(chat_id) == "123456789" else 32
+            return {"ok": True, "result": {"message_id": message_id, "chat": {"id": int(chat_id)}}}
+
+        steve_trade_bot.send_telegram_message = fake_send_message
+        exit_record = {
+            "exit_id": "human-exit-test",
+            "position_id": "human-test",
+            "approval_id": "approval-test",
+            "ticker": "MSFT",
+            "option_type": "call",
+            "expiration_date": "2026-07-17",
+            "strike_price": 475.0,
+            "contracts": 3,
+            "position_contracts": 6,
+            "entry_price": 6.15,
+            "exit_price": 11.07,
+            "pnl_percent": 80.0,
+            "pnl_dollars": 1476.0,
+            "remaining_after_exit": 3,
+            "reason": "take_profit",
+            "take_percent": 80.0,
+        }
+        text = steve_trade_bot.close_report_message(exit_record)
+        assert text == "\n".join(
+            [
+                "CLOSED PARTIAL",
+                "MSFT Jul 17 475C",
+                "Sold 3/6 @ 11.07 (+80.0%)",
+                "P/L: +$1,476 | Remain: 3",
+                "Reason: 80% target hit",
+            ]
+        )
+        report = steve_trade_bot.send_human_exit_report(exit_record)
+        assert report["status"] == "sent"
+        assert [row[0] for row in sent] == ["123456789", "-1001234567890"]
+        reports = read_jsonl(steve_trade_bot.CLOSE_REPORTS_FILE)
+        assert len(reports) == 1
+        assert reports[0]["message_text"] == text
+
+
 def test_human_exit_rules_and_steve_catch_up() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         patch_runtime_paths(tmp_path)
+        steve_trade_bot.load_bot_config = lambda required=False: None
         position = {
             "event_type": "human_paper_option_position",
             "position_id": "human-test",
@@ -306,6 +364,9 @@ def test_human_exit_rules_and_steve_catch_up() -> None:
             "source_dedupe_key": "source-test",
             "ticker": "MSFT",
             "contract_symbol": "MSFT260717C00475000",
+            "option_type": "call",
+            "expiration_date": "2026-07-17",
+            "strike_price": 475.0,
             "contracts": 5,
             "entry_price": 10.0,
             "risk_type": "percent",
@@ -411,6 +472,7 @@ def main() -> int:
     test_validation_and_approval()
     test_exit_plan_contract_allocation()
     test_multi_destination_approval_cards()
+    test_close_report_message_and_delivery()
     test_human_exit_rules_and_steve_catch_up()
     test_option_order_payload()
     test_watcher_steve_filters()

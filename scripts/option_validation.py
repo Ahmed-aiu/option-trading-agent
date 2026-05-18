@@ -341,6 +341,10 @@ def append_human_exit(
         "source_dedupe_key": position.get("source_dedupe_key"),
         "ticker": position.get("ticker"),
         "contract_symbol": position.get("contract_symbol"),
+        "option_type": position.get("option_type"),
+        "expiration_date": position.get("expiration_date"),
+        "strike_price": position.get("strike_price"),
+        "position_contracts": int(position.get("contracts") or 0),
         "reason": reason,
         "contracts": quantity,
         "exit_price": float(exit_price),
@@ -352,6 +356,22 @@ def append_human_exit(
     if extra:
         record.update(extra)
     append_jsonl(HUMAN_EXITS_FILE, record)
+    try:
+        from steve_trade_bot import send_human_exit_report
+
+        send_human_exit_report(record)
+    except Exception as exc:  # noqa: BLE001
+        append_jsonl(
+            DATA_DIR / "option_validation_errors.jsonl",
+            {
+                "event_type": "option_validation_error",
+                "recorded_at": now_iso(),
+                "source_dedupe_key": position.get("source_dedupe_key"),
+                "ticker": position.get("ticker"),
+                "reason": f"close_report_error:{type(exc).__name__}:{exc}",
+                "raw_text": "",
+            },
+        )
     return record
 
 

@@ -69,6 +69,7 @@ buy contracts=1 stop_price=3.80 take_price=6.20
 ```sh
 tail -n 5 data/steve_approval_cards.jsonl
 tail -n 5 data/steve_approval_actions.jsonl
+tail -n 5 data/steve_close_reports.jsonl
 tail -n 5 data/human_paper_positions.jsonl
 tail -n 5 data/human_paper_exits.jsonl
 tail -n 5 data/orders_paper.jsonl

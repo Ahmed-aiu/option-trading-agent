@@ -17,6 +17,7 @@ for file in \
   steve_option_exits.jsonl \
   steve_approval_cards.jsonl \
   steve_approval_actions.jsonl \
+  steve_close_reports.jsonl \
   human_paper_positions.jsonl \
   human_paper_exits.jsonl \
   option_validation_errors.jsonl \
