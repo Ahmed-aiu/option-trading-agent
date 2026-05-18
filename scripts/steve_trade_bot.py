@@ -213,7 +213,8 @@ def close_report_message(exit_record: dict[str, Any]) -> str:
             status,
             option_exit_label(exit_record),
             f"Sold {sold}/{total} @ {format_price(exit_record.get('exit_price'))} ({format_signed_pct(exit_record.get('pnl_percent'))})",
-            f"P/L: {format_signed_money(exit_record.get('pnl_dollars'))} | Remain: {remaining}",
+            f"P/L: {format_signed_money(exit_record.get('pnl_dollars'))}",
+            f"Remain: {remaining}",
             f"Reason: {close_reason_text(exit_record)}",
         ]
     )

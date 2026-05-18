@@ -339,7 +339,8 @@ def test_close_report_message_and_delivery() -> None:
                 "CLOSED PARTIAL",
                 "MSFT Jul 17 475C",
                 "Sold 3/6 @ 11.07 (+80.0%)",
-                "P/L: +$1,476 | Remain: 3",
+                "P/L: +$1,476",
+                "Remain: 3",
                 "Reason: 80% target hit",
             ]
         )
