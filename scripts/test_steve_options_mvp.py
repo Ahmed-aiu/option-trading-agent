@@ -128,8 +128,8 @@ def test_validation_and_approval() -> None:
         config = steve_trade_bot.BotConfig(
             token="test",
             approval_chat_id="-1001112223334",
-            owner_chat_id="7009538383",
-            owner_user_id="7009538383",
+            owner_chat_id="123456789",
+            owner_user_id="123456789",
         )
         unauthorized = steve_trade_bot.process_approval_message(
             {
@@ -146,7 +146,7 @@ def test_validation_and_approval() -> None:
             {
                 "message_id": 2,
                 "chat": {"id": "-1001112223334"},
-                "from": {"id": 7009538383},
+                "from": {"id": 123456789},
                 "text": "buy contracts=1",
                 "reply_to_message": {"message_id": 100},
             },
@@ -159,7 +159,7 @@ def test_validation_and_approval() -> None:
             {
                 "message_id": 20,
                 "chat": {"id": "-1001112223334"},
-                "from": {"id": 7009538383},
+                "from": {"id": 123456789},
                 "text": "buy contracts=1 stop_price=3.80 take_price=6.20",
                 "reply_to_message": {"message_id": 100},
             },
@@ -204,8 +204,8 @@ def test_validation_and_approval() -> None:
         owner_dm = steve_trade_bot.process_approval_message(
             {
                 "message_id": 5,
-                "chat": {"id": "7009538383"},
-                "from": {"id": 7009538383},
+                "chat": {"id": "123456789"},
+                "from": {"id": 123456789},
                 "text": "skip",
                 "reply_to_message": {"message_id": 100},
             },
@@ -230,6 +230,63 @@ def test_exit_plan_contract_allocation() -> None:
     custom = steve_trade_bot.exit_plan_for_contracts(2, entry_price=10, first_take_price=15)
     assert custom[0]["take_price"] == 15
     assert custom[0]["take_percent"] == 50.0
+
+
+def test_multi_destination_approval_cards() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        assert steve_trade_bot.split_approval_chat_ids("123456789,1001234567890") == [
+            "123456789",
+            "-1001234567890",
+        ]
+        config = steve_trade_bot.BotConfig(
+            token="test",
+            approval_chat_id="123456789",
+            owner_chat_id="123456789",
+            owner_user_id="123456789",
+            approval_chat_ids=("123456789", "-1001234567890"),
+        )
+        steve_trade_bot.load_bot_config = lambda required=False: config
+
+        sent_chat_ids: list[str] = []
+
+        def fake_send_message(config, text, chat_id=None):
+            sent_chat_ids.append(str(chat_id))
+            message_id = 10 if str(chat_id) == "123456789" else 20
+            return {"ok": True, "result": {"message_id": message_id, "chat": {"id": int(chat_id)}}}
+
+        steve_trade_bot.send_telegram_message = fake_send_message
+        alert = parsed_records(
+            parse_trade_alert(
+                {
+                    "captured_at": "2026-05-08T13:09:00-04:00",
+                    "dedupe_key": "screen-multi",
+                    "body": "#QQQ May 15 710 put @ 5.86 Bought 4 #hedge",
+                }
+            )
+        )[0]
+        card = steve_trade_bot.send_approval_card(alert, fake_snapshot(alert), {"position_id": "shadow-multi"})
+        assert card["status"] == "sent"
+        assert sent_chat_ids == ["123456789", "-1001234567890"]
+        assert [(row["chat_id"], row["message_id"]) for row in card["telegram_messages"]] == [
+            ("123456789", 10),
+            ("-1001234567890", 20),
+        ]
+
+        group_skip = steve_trade_bot.process_approval_message(
+            {
+                "message_id": 21,
+                "chat": {"id": "-1001234567890"},
+                "from": {"id": 222333444},
+                "text": "skip",
+                "reply_to_message": {"message_id": 20},
+            },
+            config,
+        )
+        assert group_skip["action"] == "skipped"
+        assert group_skip["authorization_scope"] == "approval_group"
+        assert group_skip["approval_id"] == card["approval_id"]
 
 
 def test_human_exit_rules_and_steve_catch_up() -> None:
@@ -348,6 +405,7 @@ def main() -> int:
     test_parser()
     test_validation_and_approval()
     test_exit_plan_contract_allocation()
+    test_multi_destination_approval_cards()
     test_human_exit_rules_and_steve_catch_up()
     test_option_order_payload()
     test_watcher_steve_filters()

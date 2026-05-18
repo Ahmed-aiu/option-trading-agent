@@ -9,6 +9,8 @@ cp config/watcher.example.yaml config/watcher.yaml
 
 Fill `.env.local` with Telegram and Alpaca paper credentials. Fill `config/watcher.yaml` with the Discord authors and channel IDs to watch.
 
+For Telegram, `STEVE_TRADE_APPROVAL_CHAT_IDS` can contain comma-separated destinations. Use it when cards should go to both the owner DM and an approval group.
+
 ## Validate Capture
 
 Generate a fresh Discord notification, then run:

@@ -170,11 +170,12 @@ Set these locally in `.env.local` or your shell:
 ```sh
 STEVE_TRADE_BOT_TOKEN=...
 STEVE_TRADE_APPROVAL_CHAT_ID=-100...
+STEVE_TRADE_APPROVAL_CHAT_IDS=123456789,-100...
 STEVE_TRADE_OWNER_CHAT_ID=...
 STEVE_TRADE_OWNER_USER_ID=...
 ```
 
-`STEVE_TRADE_APPROVAL_CHAT_ID` should be the one Telegram group where approval cards are posted. Any member who can write in that group can approve or skip. Outside that group, only the configured owner DM is accepted. Messages from any other chat are logged as unauthorized.
+`STEVE_TRADE_APPROVAL_CHAT_ID` is the primary Telegram destination. `STEVE_TRADE_APPROVAL_CHAT_IDS` is optional and can add comma-separated destinations, such as your owner DM plus one approval group. Any member who can write in an approval group can approve or skip. Outside configured approval chats, only the configured owner DM is accepted. Messages from any other chat are logged as unauthorized.
 
 To find the group id:
 
@@ -187,7 +188,7 @@ To find the group id:
 python3 scripts/steve_trade_bot.py discover-chats
 ```
 
-5. Use the printed `chat_id` for `STEVE_TRADE_APPROVAL_CHAT_ID`. Telegram supergroup ids usually look like `-100...`. Use your private chat row for `STEVE_TRADE_OWNER_CHAT_ID` and `sender_user_id` for `STEVE_TRADE_OWNER_USER_ID`.
+5. Use the printed `chat_id` for `STEVE_TRADE_APPROVAL_CHAT_ID` or add multiple values to `STEVE_TRADE_APPROVAL_CHAT_IDS`. Telegram supergroup ids usually look like `-100...`. Use your private chat row for `STEVE_TRADE_OWNER_CHAT_ID` and `sender_user_id` for `STEVE_TRADE_OWNER_USER_ID`.
 
 Legacy names `STEVE_TRADE_APPROVER_CHAT_ID` and `STEVE_TRADE_APPROVER_USER_ID` still work for the old one-person DM setup, but the group setup should use the new names above.
 

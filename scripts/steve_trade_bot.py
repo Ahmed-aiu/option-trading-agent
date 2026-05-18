@@ -50,6 +50,7 @@ class BotConfig:
     approval_chat_id: str
     owner_chat_id: str
     owner_user_id: str
+    approval_chat_ids: tuple[str, ...] = ()
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -69,22 +70,51 @@ def env_value(name: str, env_file: dict[str, str]) -> str:
     return os.environ.get(name) or env_file.get(name, "")
 
 
+def normalize_approval_chat_id(value: str) -> str:
+    chat_id = str(value).strip()
+    if re.fullmatch(r"100\d{10,}", chat_id):
+        return f"-{chat_id}"
+    return chat_id
+
+
+def split_approval_chat_ids(value: str) -> list[str]:
+    return [normalize_approval_chat_id(item) for item in re.split(r"[,;\s]+", value.strip()) if item.strip()]
+
+
+def dedupe_chat_ids(chat_ids: list[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for chat_id in chat_ids:
+        if chat_id and chat_id not in seen:
+            seen.add(chat_id)
+            deduped.append(chat_id)
+    return tuple(deduped)
+
+
 def load_bot_config(required: bool = False) -> BotConfig | None:
     env_file = load_env_file(Path(__file__).resolve().parents[1] / ".env.local")
     legacy_approver_chat_id = env_value("STEVE_TRADE_APPROVER_CHAT_ID", env_file)
     legacy_approver_user_id = env_value("STEVE_TRADE_APPROVER_USER_ID", env_file)
+    primary_approval_chat_id = normalize_approval_chat_id(
+        env_value("STEVE_TRADE_APPROVAL_CHAT_ID", env_file) or legacy_approver_chat_id
+    )
+    approval_chat_ids = dedupe_chat_ids(
+        [primary_approval_chat_id]
+        + split_approval_chat_ids(env_value("STEVE_TRADE_APPROVAL_CHAT_IDS", env_file))
+    )
     config = BotConfig(
         token=env_value("STEVE_TRADE_BOT_TOKEN", env_file),
-        approval_chat_id=env_value("STEVE_TRADE_APPROVAL_CHAT_ID", env_file) or legacy_approver_chat_id,
+        approval_chat_id=approval_chat_ids[0] if approval_chat_ids else "",
         owner_chat_id=env_value("STEVE_TRADE_OWNER_CHAT_ID", env_file) or legacy_approver_chat_id,
         owner_user_id=env_value("STEVE_TRADE_OWNER_USER_ID", env_file) or legacy_approver_user_id,
+        approval_chat_ids=approval_chat_ids,
     )
-    if required and (not config.token or not config.approval_chat_id or not config.owner_chat_id or not config.owner_user_id):
+    if required and (not config.token or not config.approval_chat_ids or not config.owner_chat_id or not config.owner_user_id):
         raise RuntimeError(
-            "Missing STEVE_TRADE_BOT_TOKEN, STEVE_TRADE_APPROVAL_CHAT_ID, "
+            "Missing STEVE_TRADE_BOT_TOKEN, STEVE_TRADE_APPROVAL_CHAT_ID or STEVE_TRADE_APPROVAL_CHAT_IDS, "
             "STEVE_TRADE_OWNER_CHAT_ID, or STEVE_TRADE_OWNER_USER_ID"
         )
-    if not config.token or not config.approval_chat_id or not config.owner_chat_id or not config.owner_user_id:
+    if not config.token or not config.approval_chat_ids or not config.owner_chat_id or not config.owner_user_id:
         return None
     return config
 
@@ -109,8 +139,12 @@ def telegram_request(token: str, method: str, payload: dict[str, Any]) -> dict[s
         return json.loads(response.read().decode("utf-8"))
 
 
-def send_telegram_message(config: BotConfig, text: str) -> dict[str, Any]:
-    return telegram_request(config.token, "sendMessage", {"chat_id": config.approval_chat_id, "text": text})
+def configured_approval_chat_ids(config: BotConfig) -> tuple[str, ...]:
+    return config.approval_chat_ids or ((str(config.approval_chat_id),) if config.approval_chat_id else ())
+
+
+def send_telegram_message(config: BotConfig, text: str, chat_id: str | None = None) -> dict[str, Any]:
+    return telegram_request(config.token, "sendMessage", {"chat_id": chat_id or config.approval_chat_id, "text": text})
 
 
 def load_state() -> dict[str, Any]:
@@ -132,7 +166,7 @@ def approval_id_for_alert(alert: dict[str, Any]) -> str:
 
 
 def existing_card(approval_id: str) -> dict[str, Any] | None:
-    for row in read_jsonl(APPROVAL_CARDS_FILE):
+    for row in reversed(read_jsonl(APPROVAL_CARDS_FILE)):
         if row.get("approval_id") == approval_id:
             return row
     return None
@@ -275,10 +309,85 @@ def approval_message(alert: dict[str, Any], snapshot: dict[str, Any], approval_i
     )
 
 
+def successful_card_message_refs(card: dict[str, Any]) -> list[dict[str, Any]]:
+    refs = [
+        row
+        for row in (card.get("telegram_messages") or [])
+        if row.get("status") == "sent" and row.get("chat_id") is not None and row.get("message_id") is not None
+    ]
+    if not refs and card.get("telegram_message_id") is not None:
+        refs.append(
+            {
+                "chat_id": card.get("telegram_chat_id"),
+                "message_id": card.get("telegram_message_id"),
+                "status": card.get("status"),
+            }
+        )
+    return refs
+
+
+def refresh_card_status_from_messages(card: dict[str, Any]) -> dict[str, Any]:
+    messages = card.get("telegram_messages") or []
+    successes = [row for row in messages if row.get("status") == "sent"]
+    failures = [row for row in messages if row.get("status") != "sent"]
+    if successes:
+        first_success = successes[0]
+        card["telegram_message_id"] = first_success.get("message_id")
+        card["telegram_chat_id"] = first_success.get("chat_id")
+        card["status"] = "partial_sent" if failures else "sent"
+        card["reason"] = "; ".join(
+            f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
+        )
+    elif messages:
+        card["status"] = "send_failed"
+        card["reason"] = "; ".join(
+            f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
+        )
+    return card
+
+
+def send_card_to_configured_chats(card: dict[str, Any], config: BotConfig) -> tuple[dict[str, Any], bool]:
+    messages = list(card.get("telegram_messages") or [])
+    if not messages:
+        messages = successful_card_message_refs(card)
+    sent_chat_ids = {str(row.get("chat_id")) for row in messages if row.get("status") == "sent" and row.get("chat_id") is not None}
+    changed = False
+    for chat_id in configured_approval_chat_ids(config):
+        if str(chat_id) in sent_chat_ids:
+            continue
+        try:
+            response = send_telegram_message(config, str(card["message_text"]), chat_id=chat_id)
+            if not response.get("ok"):
+                raise RuntimeError(f"Telegram returned non-ok response: {response}")
+            result = response.get("result", {})
+            chat = result.get("chat") or {}
+            messages.append(
+                {
+                    "chat_id": str(chat.get("id") if chat.get("id") is not None else chat_id),
+                    "message_id": result.get("message_id"),
+                    "status": "sent",
+                    "reason": "",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            messages.append({"chat_id": str(chat_id), "message_id": None, "status": "send_failed", "reason": str(exc)})
+        changed = True
+    card["telegram_messages"] = messages
+    refresh_card_status_from_messages(card)
+    return card, changed
+
+
 def send_approval_card(alert: dict[str, Any], snapshot: dict[str, Any], shadow_position: dict[str, Any]) -> dict[str, Any]:
     approval_id = approval_id_for_alert(alert)
     existing = existing_card(approval_id)
     if existing:
+        config = load_bot_config(required=False)
+        if config is not None:
+            updated, changed = send_card_to_configured_chats(existing, config)
+            if changed:
+                updated["updated_at"] = now_iso()
+                append_jsonl(APPROVAL_CARDS_FILE, updated)
+            return updated
         return existing
     config = load_bot_config(required=False)
     text = approval_message(alert, snapshot, approval_id)
@@ -292,23 +401,14 @@ def send_approval_card(alert: dict[str, Any], snapshot: dict[str, Any], shadow_p
         "validation_id": validation_id(alert),
         "shadow_position_id": shadow_position.get("position_id"),
         "telegram_message_id": None,
+        "telegram_messages": [],
         "message_text": text,
         "alert": alert,
         "snapshot": snapshot,
         "shadow_position": shadow_position,
     }
     if config is not None:
-        try:
-            response = send_telegram_message(config, text)
-            if not response.get("ok"):
-                raise RuntimeError(f"Telegram returned non-ok response: {response}")
-            card["status"] = "sent"
-            card["reason"] = ""
-            card["telegram_message_id"] = response.get("result", {}).get("message_id")
-            card["telegram_chat_id"] = response.get("result", {}).get("chat", {}).get("id")
-        except Exception as exc:  # noqa: BLE001
-            card["status"] = "send_failed"
-            card["reason"] = str(exc)
+        card, _changed = send_card_to_configured_chats(card, config)
     append_jsonl(APPROVAL_CARDS_FILE, card)
     return card
 
@@ -370,11 +470,16 @@ def actions_for_approval(approval_id: str) -> list[dict[str, Any]]:
 def card_for_message(message: dict[str, Any]) -> dict[str, Any] | None:
     reply = message.get("reply_to_message") or {}
     reply_message_id = reply.get("message_id")
+    chat_id = chat_id_from_message(message)
     cards = read_jsonl(APPROVAL_CARDS_FILE)
     if reply_message_id is not None:
-        for card in cards:
-            if str(card.get("telegram_message_id")) == str(reply_message_id):
-                return card
+        for card in reversed(cards):
+            for ref in successful_card_message_refs(card):
+                ref_chat_id = ref.get("chat_id")
+                if str(ref.get("message_id")) == str(reply_message_id) and (
+                    ref_chat_id is None or str(ref_chat_id) == str(chat_id)
+                ):
+                    return card
     acted = {row.get("approval_id") for row in read_jsonl(APPROVAL_ACTIONS_FILE) if row.get("action") in {"approved", "skipped"}}
     pending = [card for card in cards if card.get("approval_id") not in acted]
     return pending[-1] if pending else None
@@ -486,7 +591,7 @@ def sender_id_from_message(message: dict[str, Any]) -> str:
 def authorization_for_message(message: dict[str, Any], config: BotConfig) -> tuple[bool, str]:
     chat_id = chat_id_from_message(message)
     sender_id = sender_id_from_message(message)
-    if chat_id == str(config.approval_chat_id):
+    if chat_id in {str(item) for item in configured_approval_chat_ids(config)}:
         return True, "approval_group"
     if chat_id == str(config.owner_chat_id) and sender_id == str(config.owner_user_id):
         return True, "owner_dm"
