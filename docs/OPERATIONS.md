@@ -56,6 +56,13 @@ cat data/live_pipeline_heartbeat.json
 ```
 
 The `recorded_at` timestamp should refresh about every 30 seconds while the LaunchAgent is running.
+For historical checks around a missed alert, use the append-only heartbeat history:
+
+```sh
+tail -n 20 data/live_pipeline_heartbeats.jsonl
+```
+
+If the heartbeat was fresh but `data/raw_notifications.jsonl` has no matching Discord row, the miss happened before parsing/Telegram, usually because Discord/macOS did not emit or persist a notification body for the channel message.
 
 Uninstall:
 

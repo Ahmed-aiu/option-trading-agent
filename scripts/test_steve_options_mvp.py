@@ -634,15 +634,22 @@ def test_watcher_steve_filters() -> None:
 def test_live_pipeline_heartbeat() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         heartbeat_file = Path(tmp) / "heartbeat.json"
+        heartbeat_history_file = Path(tmp) / "heartbeats.jsonl"
         original = run_live_pipeline.HEARTBEAT_FILE
+        original_history = run_live_pipeline.HEARTBEAT_HISTORY_FILE
         try:
             run_live_pipeline.HEARTBEAT_FILE = heartbeat_file
+            run_live_pipeline.HEARTBEAT_HISTORY_FILE = heartbeat_history_file
             run_live_pipeline.write_heartbeat({"event_type": "live_pipeline_heartbeat", "capture_written": 0})
             heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+            history = read_jsonl(heartbeat_history_file)
             assert heartbeat["event_type"] == "live_pipeline_heartbeat"
             assert heartbeat["capture_written"] == 0
+            assert history[-1]["event_type"] == "live_pipeline_heartbeat"
+            assert history[-1]["capture_written"] == 0
         finally:
             run_live_pipeline.HEARTBEAT_FILE = original
+            run_live_pipeline.HEARTBEAT_HISTORY_FILE = original_history
 
 
 def main() -> int:

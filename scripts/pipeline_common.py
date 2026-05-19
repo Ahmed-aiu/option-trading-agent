@@ -197,6 +197,7 @@ def atomic_touch_jsonl_files() -> None:
         DATA_DIR / "human_paper_exits.jsonl",
         DATA_DIR / "option_validation_errors.jsonl",
         DATA_DIR / "daily_option_summaries.jsonl",
+        DATA_DIR / "live_pipeline_heartbeats.jsonl",
     ]:
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
