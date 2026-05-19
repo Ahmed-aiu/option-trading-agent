@@ -85,6 +85,8 @@ buy contracts=1 stop_price=3.80 take_price=6.20
 
 `buy` uses the alert contract count, or 1 if the alert has no count, with the default 35% stop and 80% first take-profit.
 
+The current exit behavior and proposed next exit-policy design are documented in `docs/EXIT_STRATEGY.md`.
+
 ## Check Runtime State
 
 ```sh

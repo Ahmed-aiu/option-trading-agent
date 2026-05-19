@@ -2,13 +2,15 @@
 
 ## Purpose
 
-This project validates Steve-style Discord option alerts without auto-trading. It captures local Discord notifications, parses option alerts, enriches them with Alpaca-first market data, sends Telegram approval prompts, and records local paper outcomes.
+This project validates Steve-style Discord option alerts with local paper trading. It captures local Discord notifications, parses option alerts, enriches them with Alpaca-first market data, routes hedge alerts to Telegram approval, auto-routes non-hedge alerts to paper trading, and records local paper outcomes.
 
 ## Boundaries
 
 - Paper and validation first.
-- Human approval required for human paper entries.
+- Non-hedge option alerts are allowed to auto-enter paper trades.
+- Hedge option alerts require human approval because they may not make sense without an existing position to hedge.
 - Alpaca paper order submission is disabled unless explicitly enabled with `OPENCLAW_ENABLE_PAPER_ORDERS=true`.
+- Broker-side paper buys can be attempted when enabled; broker-side paper sells are not yet wired as the source of truth.
 - Runtime files are append-only JSONL ledgers for auditability.
 - Missing data is logged instead of guessed.
 
@@ -34,7 +36,9 @@ option_validation.py
 steve_trade_bot.py
   sends Telegram approval cards
   accepts group/owner replies
-  creates human paper positions
+  creates approved paper positions
+  creates auto paper positions for non-hedge alerts
+  sends auto-buy and close reports
 
 alpaca_options.py
   builds OCC option symbols
@@ -58,6 +62,7 @@ Core ledgers:
 - `steve_option_exits.jsonl`: parsed Steve closes matched to shadow positions.
 - `steve_approval_cards.jsonl`: Telegram card audit.
 - `steve_approval_actions.jsonl`: Telegram reply audit.
+- `steve_auto_buy_reports.jsonl`: Telegram auto paper buy report audit.
 - `steve_close_reports.jsonl`: Telegram close-report audit.
 - `human_paper_positions.jsonl`: approved human paper entries.
 - `human_paper_exits.jsonl`: local paper exits from targets, stops, or Steve catch-up.
@@ -65,12 +70,16 @@ Core ledgers:
 
 ## Exit Logic
 
-Approved human paper positions carry an `exit_plan`:
+Paper positions currently carry an `exit_plan`:
 
 - `contracts=1`: one tranche at +80%.
 - `contracts>1`: `floor(total / 2)` at +80%, `floor(remaining / 2)` at +120%, rest at +200%.
 
+The default stop is -35% for percent-risk entries. When the stop is hit, the local exit manager closes all remaining contracts in the paper ledger.
+
 When Steve sends partial closes, the system treats Steve's closed contract count as cumulative. It only records a local paper exit when Steve's cumulative closed amount is greater than the local paper amount already closed.
+
+This exit logic is intentionally conservative for short-dated options. It may leave gains on the table for longer-dated swing contracts, so future changes should be made through an explicit exit policy per position rather than changing the global target ladder loosely.
 
 ## Configuration
 
