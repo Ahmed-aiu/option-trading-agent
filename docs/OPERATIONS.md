@@ -21,6 +21,8 @@ python3 scripts/notification_probe.py --app Discord --last-minutes 30
 
 If no Discord notification appears, check macOS notification permissions, Discord channel notification settings, Focus mode, notification previews, and Full Disk Access for the terminal app.
 
+Steve close replies often arrive as short messages like `Closed @ 7.54` or `Sold 2 @ 3.26`, so the watcher should keep `capture_all_author_notifications: true`. That records every notification from configured Steve author names first, then lets the parser/audit layer decide whether the text is a supported entry, exit, or reject.
+
 ## Run Once
 
 ```sh
@@ -46,6 +48,14 @@ Check status:
 ```sh
 launchctl print gui/$(id -u)/ai.openclaw.trading-alert-watcher
 ```
+
+Check that the live loop is not stalled:
+
+```sh
+cat data/live_pipeline_heartbeat.json
+```
+
+The `recorded_at` timestamp should refresh about every 30 seconds while the LaunchAgent is running.
 
 Uninstall:
 

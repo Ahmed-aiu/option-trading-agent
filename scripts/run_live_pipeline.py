@@ -4,22 +4,31 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import time
 
 from notification_watcher import poll_once
 from option_validation import track_open_positions_once
-from pipeline_common import CONFIG_DIR, DATA_DIR, LOG_DIR, atomic_touch_jsonl_files, load_seen_keys, load_simple_yaml, read_jsonl, setup_logging
+from pipeline_common import CONFIG_DIR, DATA_DIR, LOG_DIR, atomic_touch_jsonl_files, load_seen_keys, load_simple_yaml, now_iso, read_jsonl, setup_logging
 from run_pipeline_once import process_raw_notifications
 from steve_trade_bot import poll_once as poll_telegram_approvals
 
 
 STOP = False
+HEARTBEAT_FILE = DATA_DIR / "live_pipeline_heartbeat.json"
 
 
 def request_stop(signum: int, frame: object) -> None:
     global STOP
     STOP = True
+
+
+def write_heartbeat(record: dict) -> None:
+    HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = HEARTBEAT_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    tmp_path.replace(HEARTBEAT_FILE)
 
 
 def main() -> int:
@@ -35,9 +44,12 @@ def main() -> int:
     seen_notifications = load_seen_keys(DATA_DIR / "raw_notifications.jsonl")
     interval = float(config.get("poll_interval_seconds", 1))
     option_track_interval = float(config.get("option_track_interval_seconds", 15))
+    heartbeat_interval = float(config.get("heartbeat_interval_seconds", 30))
     last_option_track = 0.0
+    last_heartbeat = 0.0
     logger.info("Live pipeline starting")
     while not STOP:
+        loop_started = time.monotonic()
         written, duplicates = poll_once(config, seen_notifications, logger)
         counts = process_raw_notifications(
             read_jsonl(DATA_DIR / "raw_notifications.jsonl"),
@@ -56,6 +68,21 @@ def main() -> int:
                 last_option_track = now_monotonic
             except Exception as exc:  # noqa: BLE001
                 logger.info("option_tracking_skipped=%s", exc)
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_heartbeat >= heartbeat_interval:
+            write_heartbeat(
+                {
+                    "event_type": "live_pipeline_heartbeat",
+                    "recorded_at": now_iso(config.get("timezone", "America/Detroit")),
+                    "capture_written": written,
+                    "duplicate_notifications": duplicates,
+                    "pipeline": counts,
+                    "telegram": telegram_counts,
+                    "option_tracking": option_counts,
+                    "loop_seconds": round(now_monotonic - loop_started, 3),
+                }
+            )
+            last_heartbeat = now_monotonic
         if written or duplicates or counts["raw_new"] or telegram_counts.get("actions") or option_counts.get("snapshots"):
             logger.info(
                 "capture_written=%d duplicate_notifications=%d pipeline=%s telegram=%s option_tracking=%s",

@@ -72,6 +72,8 @@ def is_matching_notification(record: dict[str, Any], config: dict[str, Any]) -> 
     channel_ids = [str(item) for item in config.get("alert_channel_ids", [])]
     if config.get("require_alert_channel_id_match", False) and not notification_has_channel_id(record, channel_ids):
         return False
+    if author_names and config.get("capture_all_author_notifications", True):
+        return True
     if config.get("write_all_discord_notifications", False):
         return True
     title_text = " ".join(str(record.get(key) or "") for key in ("title", "subtitle"))

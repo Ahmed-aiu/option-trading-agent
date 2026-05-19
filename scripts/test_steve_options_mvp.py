@@ -10,6 +10,8 @@ from pathlib import Path
 import alpaca_options
 import notification_watcher
 import option_validation
+import run_live_pipeline
+import run_pipeline_once
 import steve_trade_bot
 from parse_alert import parse_trade_alert
 from pipeline_common import append_jsonl, read_jsonl
@@ -85,6 +87,46 @@ def test_parser() -> None:
     assert exit_alert["side"] == "exit"
     assert exit_alert["contracts"] == 2
     assert exit_alert["exit_price"] == 4.11
+    assert exit_alert["ticker"] is None
+
+    quoted_exit = parse_trade_alert(
+        {
+            "captured_at": "2026-05-18T14:17:00-04:00",
+            "dedupe_key": "exit-quoted-xom",
+            "body": "@OTWSteve\n#XOM MAY 22 160 call @ 1.62 Bought 10 #swing\nSteveOTWS\nSold 2 @ 3.26",
+        }
+    )
+    assert quoted_exit["side"] == "exit"
+    assert quoted_exit["ticker"] == "XOM"
+    assert quoted_exit["expiration_date"] == "2026-05-22"
+    assert quoted_exit["option_type"] == "call"
+    assert quoted_exit["strike_price"] == 160.0
+    assert quoted_exit["contracts"] == 2
+    assert quoted_exit["exit_price"] == 3.26
+
+    missing_type_exit = parse_trade_alert(
+        {
+            "captured_at": "2026-05-18T13:38:00-04:00",
+            "dedupe_key": "exit-quoted-spy",
+            "body": "@OTWSteve\n#SPY MAY 18 744 @ 1.81 Bought 5 #lotto\nSteveOTWS\nClosed @ 7.54",
+        }
+    )
+    assert missing_type_exit["side"] == "exit"
+    assert missing_type_exit["ticker"] == "SPY"
+    assert missing_type_exit["expiration_date"] == "2026-05-18"
+    assert missing_type_exit["strike_price"] == 744.0
+    assert missing_type_exit["contracts"] is None
+    assert missing_type_exit["exit_price"] == 7.54
+
+    author_only_exit = parse_trade_alert(
+        {
+            "dedupe_key": "exit-author-only",
+            "title": "SteveOTWS (#short-term-call-outs-same-week-or-1-week)",
+            "body": "Sold 2 @ 3.26",
+        }
+    )
+    assert author_only_exit["side"] == "exit"
+    assert author_only_exit["ticker"] is None
 
 
 def test_validation_and_approval() -> None:
@@ -422,6 +464,111 @@ def test_human_exit_rules_and_steve_catch_up() -> None:
         assert catch_up[0]["remaining_after_exit"] == 1
 
 
+def test_option_exit_reply_matches_shadow_context() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        append_jsonl(
+            option_validation.SHADOW_POSITIONS_FILE,
+            {
+                "event_type": "shadow_option_position",
+                "position_id": "shadow-xom",
+                "opened_at": "2026-05-15T15:03:00-04:00",
+                "source_dedupe_key": "source-xom",
+                "ticker": "XOM",
+                "contract_symbol": "XOM260522C00160000",
+                "option_type": "call",
+                "expiration_date": "2026-05-22",
+                "strike_price": 160.0,
+                "contracts": 10,
+            },
+        )
+        append_jsonl(
+            option_validation.SHADOW_POSITIONS_FILE,
+            {
+                "event_type": "shadow_option_position",
+                "position_id": "shadow-qqq-newer",
+                "opened_at": "2026-05-18T10:00:00-04:00",
+                "source_dedupe_key": "source-qqq",
+                "ticker": "QQQ",
+                "contract_symbol": "QQQ260519P00710000",
+                "option_type": "put",
+                "expiration_date": "2026-05-19",
+                "strike_price": 710.0,
+                "contracts": 3,
+            },
+        )
+        exit_alert = parse_trade_alert(
+            {
+                "captured_at": "2026-05-18T14:17:00-04:00",
+                "dedupe_key": "exit-xom-context",
+                "body": "@OTWSteve\n#XOM MAY 22 160 call @ 1.62 Bought 10 #swing\nSteveOTWS\nSold 2 @ 3.26",
+            }
+        )
+        result = option_validation.handle_option_exit(exit_alert)
+        assert result["created"] is True
+        exits = read_jsonl(option_validation.STEVE_EXITS_FILE)
+        assert len(exits) == 1
+        assert exits[0]["ticker"] == "XOM"
+        assert exits[0]["matched_shadow_position_id"] == "shadow-xom"
+        assert exits[0]["match_confidence"] == "high"
+        assert exits[0]["contracts"] == 2
+
+
+def test_pipeline_processes_close_reply_as_option_exit() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        original_data_dir = run_pipeline_once.DATA_DIR
+        original_processed_file = run_pipeline_once.PROCESSED_FILE
+        original_summary = run_pipeline_once.write_openclaw_summary
+        try:
+            run_pipeline_once.DATA_DIR = tmp_path
+            run_pipeline_once.PROCESSED_FILE = tmp_path / "processed_notifications.jsonl"
+            run_pipeline_once.write_openclaw_summary = lambda decision: None
+            append_jsonl(
+                option_validation.SHADOW_POSITIONS_FILE,
+                {
+                    "event_type": "shadow_option_position",
+                    "position_id": "shadow-xom",
+                    "opened_at": "2026-05-15T15:03:00-04:00",
+                    "source_dedupe_key": "source-xom",
+                    "ticker": "XOM",
+                    "contract_symbol": "XOM260522C00160000",
+                    "option_type": "call",
+                    "expiration_date": "2026-05-22",
+                    "strike_price": 160.0,
+                    "contracts": 10,
+                },
+            )
+            counts = run_pipeline_once.process_raw_notifications(
+                [
+                    {
+                        "event_type": "raw_discord_notification",
+                        "dedupe_key": "raw-close-xom",
+                        "captured_at": "2026-05-18T14:17:01-04:00",
+                        "notification_timestamp": "2026-05-18T14:17:00-04:00",
+                        "source_app": "Discord",
+                        "bundle_id": "com.hnc.Discord",
+                        "title": "SteveOTWS (#short-term-call-outs-same-week-or-1-week)",
+                        "subtitle": "short-term-call-outs-same-week-or-1-week",
+                        "body": "@OTWSteve\n#XOM MAY 22 160 call @ 1.62 Bought 10 #swing\nSold 2 @ 3.26",
+                    }
+                ],
+                dry_run_orders=False,
+                prior_decisions_override=[],
+            )
+            assert counts["parsed"] == 1
+            assert counts["option_exits"] == 1
+            assert counts["option_approval_cards"] == 0
+            exits = read_jsonl(option_validation.STEVE_EXITS_FILE)
+            assert exits[0]["matched_shadow_position_id"] == "shadow-xom"
+        finally:
+            run_pipeline_once.DATA_DIR = original_data_dir
+            run_pipeline_once.PROCESSED_FILE = original_processed_file
+            run_pipeline_once.write_openclaw_summary = original_summary
+
+
 def test_option_order_payload() -> None:
     payload = alpaca_options.build_option_order_payload(
         {
@@ -442,9 +589,10 @@ def test_watcher_steve_filters() -> None:
     config = {
         "app_names": ["Discord"],
         "bundle_ids": ["com.hnc.Discord"],
-        "alert_author_names": ["OTWSteve"],
+        "alert_author_names": ["OTWSteve", "SteveOTWS"],
         "alert_channel_ids": ["492098253337264138"],
         "require_alert_channel_id_match": False,
+        "capture_all_author_notifications": True,
         "body_keywords": ["CALL", "PUT"],
     }
     steve_record = {
@@ -461,11 +609,40 @@ def test_watcher_steve_filters() -> None:
     non_steve_record["title"] = "ahmed_aiu"
     assert notification_watcher.is_matching_notification(non_steve_record, config) is False
 
+    close_record = dict(steve_record)
+    close_record["title"] = "OTWSteve (#short-term-call-outs-same-week-or-1-week)"
+    close_record["body"] = "Closed @ 7.54"
+    assert notification_watcher.is_matching_notification(close_record, config) is True
+
+    sold_record = dict(close_record)
+    sold_record["title"] = "SteveOTWS (#short-term-call-outs-same-week-or-1-week)"
+    sold_record["body"] = "Sold 2 @ 3.26"
+    assert notification_watcher.is_matching_notification(sold_record, config) is True
+
+    keyword_config = dict(config)
+    keyword_config["capture_all_author_notifications"] = False
+    keyword_config["body_keywords"] = ["CALL", "PUT", "SOLD", "CLOSED", "CLOSE", "STOPPED"]
+    assert notification_watcher.is_matching_notification(sold_record, keyword_config) is True
+
     strict_config = dict(config)
     strict_config["require_alert_channel_id_match"] = True
     assert notification_watcher.is_matching_notification(steve_record, strict_config) is False
     steve_record["raw"]["thread"] = "492098253337264138"
     assert notification_watcher.is_matching_notification(steve_record, strict_config) is True
+
+
+def test_live_pipeline_heartbeat() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        heartbeat_file = Path(tmp) / "heartbeat.json"
+        original = run_live_pipeline.HEARTBEAT_FILE
+        try:
+            run_live_pipeline.HEARTBEAT_FILE = heartbeat_file
+            run_live_pipeline.write_heartbeat({"event_type": "live_pipeline_heartbeat", "capture_written": 0})
+            heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+            assert heartbeat["event_type"] == "live_pipeline_heartbeat"
+            assert heartbeat["capture_written"] == 0
+        finally:
+            run_live_pipeline.HEARTBEAT_FILE = original
 
 
 def main() -> int:
@@ -475,8 +652,11 @@ def main() -> int:
     test_multi_destination_approval_cards()
     test_close_report_message_and_delivery()
     test_human_exit_rules_and_steve_catch_up()
+    test_option_exit_reply_matches_shadow_context()
+    test_pipeline_processes_close_reply_as_option_exit()
     test_option_order_payload()
     test_watcher_steve_filters()
+    test_live_pipeline_heartbeat()
     print("Steve options MVP tests passed")
     return 0
 

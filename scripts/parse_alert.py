@@ -80,6 +80,17 @@ OPTION_LINE_RE = re.compile(
     r"(?P<quantity>\d+)?",
     re.I,
 )
+OPTION_CONTEXT_RE = re.compile(
+    r"(?:^|\s)#?(?P<ticker>[A-Z]{1,5})\s+"
+    r"(?P<month>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
+    r"(?P<day>\d{1,2})\s+"
+    r"(?P<strike>\d+(?:\.\d+)?)"
+    r"(?:\s+(?P<option_type>calls?|puts?))?\s+@\s*"
+    rf"(?P<entry>{PRICE_VALUE_RE})\s+"
+    r"(?P<action>bought|buy|added|add)\s*"
+    r"(?P<quantity>\d+)?",
+    re.I,
+)
 OPTION_EXIT_PRICE_RE = re.compile(
     rf"\b(?P<action>sold|sell|trim(?:med)?|trim|closed?|exit(?:ed)?)\s*"
     rf"(?P<quantity>\d+)?\s*(?:@|at)\s*(?P<exit_price>{PRICE_VALUE_RE})",
@@ -204,17 +215,50 @@ def parse_option_alerts(raw_text: str, record: dict[str, Any], config: dict[str,
     return alerts
 
 
+def option_context_for_exit(
+    raw_text: str,
+    exit_start: int,
+    record: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    matches = list(OPTION_CONTEXT_RE.finditer(raw_text))
+    prior_matches = [match for match in matches if match.start() < exit_start]
+    if prior_matches:
+        match = prior_matches[-1]
+    elif matches:
+        match = matches[-1]
+    else:
+        hashtag_matches = list(re.finditer(r"#(?P<ticker>[A-Z]{1,5})\b", raw_text))
+        if not hashtag_matches:
+            return {}
+        return {"ticker": hashtag_matches[-1].group("ticker").upper()}
+
+    context: dict[str, Any] = {
+        "ticker": match.group("ticker").upper(),
+        "expiration_date": option_expiration(match.group("month"), match.group("day"), config, record),
+        "strike_price": float(match.group("strike")),
+        "context_entry_price": float(match.group("entry")),
+    }
+    option_type = match.group("option_type")
+    if option_type:
+        context["option_type"] = "call" if option_type.lower().startswith("call") else "put"
+    quantity = match.group("quantity")
+    if quantity:
+        context["context_contracts"] = int(quantity)
+    return context
+
+
 def parse_option_exit(raw_text: str, record: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
     match = OPTION_EXIT_PRICE_RE.search(raw_text)
     if not match:
         return None
     source_key = record.get("dedupe_key") or record.get("source_dedupe_key") or ""
-    ticker_match = re.search(r"#?(?P<ticker>[A-Z]{1,5})\b", raw_text)
-    return {
+    context = option_context_for_exit(raw_text, match.start(), record, config)
+    exit_record = {
         "event_type": "parsed_trade_alert",
         "source_dedupe_key": source_key,
         "parsed_at": now_iso(),
-        "ticker": ticker_match.group("ticker").upper() if ticker_match else None,
+        "ticker": context.get("ticker"),
         "side": "exit",
         "instrument_type": "option",
         "entry_type": "exit_candidate",
@@ -225,11 +269,17 @@ def parse_option_exit(raw_text: str, record: dict[str, Any], config: dict[str, A
         "stop_price": None,
         "target_price": None,
         "time_in_force": config.get("default_time_in_force", "day"),
-        "confidence": "medium" if ticker_match else "low",
+        "confidence": "medium" if context.get("ticker") else "low",
         "raw_text": raw_text,
         "parser_version": PARSER_VERSION,
         "notification_timestamp": record.get("notification_timestamp"),
     }
+    for key in ("expiration_date", "option_type", "strike_price", "context_entry_price", "context_contracts"):
+        if key in context:
+            exit_record[key] = context[key]
+    if context.get("ticker"):
+        exit_record["confidence"] = "high" if context.get("strike_price") is not None else "medium"
+    return exit_record
 
 
 def parse_trade_alert(record: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any] | list[dict[str, Any]]:
@@ -238,16 +288,15 @@ def parse_trade_alert(record: dict[str, Any], config: dict[str, Any] | None = No
     lowered = raw_text.lower()
     if not raw_text:
         raise ParseRejected("empty_alert")
+    option_exit = parse_option_exit(raw_text, record, config)
+    if option_exit:
+        return option_exit
     if re.search(r"\b(CALLS?|PUTS?)\b", raw_text, re.I):
         if not config.get("allow_options", False):
             raise ParseRejected("options_disabled")
         option_alerts = parse_option_alerts(raw_text, record, config)
         if option_alerts:
             return option_alerts
-
-    option_exit = parse_option_exit(raw_text, record, config)
-    if option_exit:
-        return option_exit
 
     for phrase in config.get("ambiguous_phrases", []):
         if phrase.lower() in lowered:

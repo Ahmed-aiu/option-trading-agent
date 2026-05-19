@@ -9,6 +9,7 @@ alert_channel_ids:
   - "replace_with_discord_channel_id"
 watchlist_channel_ids: []
 require_alert_channel_id_match: false
+capture_all_author_notifications: true
 title_keywords:
   - Trading
   - Traders
@@ -25,6 +26,7 @@ body_keywords:
   - TARGET
 poll_interval_seconds: 1
 option_track_interval_seconds: 15
+heartbeat_interval_seconds: 30
 dedupe_window_minutes: 60
 write_all_discord_notifications: false
 timezone: America/Detroit

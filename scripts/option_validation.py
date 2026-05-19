@@ -176,6 +176,19 @@ def match_shadow_position_for_exit(exit_alert: dict[str, Any]) -> dict[str, Any]
         candidates = [row for row in candidates if row.get("ticker") == ticker]
     if not candidates:
         return None
+
+    def keep_if_any(rows: list[dict[str, Any]], key: str, value: Any) -> list[dict[str, Any]]:
+        if value in (None, ""):
+            return rows
+        filtered = [row for row in rows if str(row.get(key)) == str(value)]
+        return filtered or rows
+
+    candidates = keep_if_any(candidates, "expiration_date", exit_alert.get("expiration_date"))
+    candidates = keep_if_any(candidates, "option_type", exit_alert.get("option_type"))
+    strike_price = safe_float(exit_alert.get("strike_price"))
+    if strike_price is not None:
+        filtered = [row for row in candidates if safe_float(row.get("strike_price")) == strike_price]
+        candidates = filtered or candidates
     return candidates[-1]
 
 
@@ -208,6 +221,11 @@ def handle_option_exit(exit_alert: dict[str, Any]) -> dict[str, Any]:
         "match_confidence": "medium" if matched and exit_alert.get("ticker") else ("low" if matched else "none"),
         "raw_text": exit_alert.get("raw_text", ""),
     }
+    for key in ("expiration_date", "option_type", "strike_price", "context_entry_price", "context_contracts"):
+        if exit_alert.get(key) is not None:
+            record[key] = exit_alert.get(key)
+    if matched and exit_alert.get("expiration_date") and exit_alert.get("strike_price"):
+        record["match_confidence"] = "high"
     append_jsonl(STEVE_EXITS_FILE, record)
     human_exits = apply_steve_exit_to_human_positions(record, matched)
     return {
