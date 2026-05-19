@@ -87,6 +87,7 @@ def process_raw_notifications(
         "alpaca_dry_runs": 0,
         "option_shadow_positions": 0,
         "option_approval_cards": 0,
+        "option_auto_buys": 0,
         "option_exits": 0,
         "option_validation_errors": 0,
     }
@@ -113,6 +114,8 @@ def process_raw_notifications(
                             counts["option_shadow_positions"] += 1
                         if (validation_result.get("approval_card") or {}).get("approval_id"):
                             counts["option_approval_cards"] += 1
+                        if (validation_result.get("auto_buy") or {}).get("created"):
+                            counts["option_auto_buys"] += 1
                     elif is_option_exit(parsed):
                         validation_result = handle_option_exit(parsed)
                         if validation_result.get("created"):

@@ -23,6 +23,7 @@ from pipeline_common import DATA_DIR, append_jsonl, now_iso, parse_datetime, rea
 APPROVAL_CARDS_FILE = DATA_DIR / "steve_approval_cards.jsonl"
 APPROVAL_ACTIONS_FILE = DATA_DIR / "steve_approval_actions.jsonl"
 CLOSE_REPORTS_FILE = DATA_DIR / "steve_close_reports.jsonl"
+AUTO_BUY_REPORTS_FILE = DATA_DIR / "steve_auto_buy_reports.jsonl"
 HUMAN_POSITIONS_FILE = DATA_DIR / "human_paper_positions.jsonl"
 BOT_STATE_FILE = DATA_DIR / "steve_trade_bot_state.json"
 DEFAULT_STOP_PERCENT = 35.0
@@ -191,6 +192,21 @@ def option_exit_label(exit_record: dict[str, Any]) -> str:
     return str(exit_record.get("contract_symbol") or ticker or "OPTION")
 
 
+def option_alert_label(alert: dict[str, Any], snapshot: dict[str, Any] | None = None) -> str:
+    ticker = str(alert.get("ticker") or "").upper()
+    expiration = alert.get("expiration_date")
+    strike = alert.get("strike_price")
+    option_type = str(alert.get("option_type") or "").lower()
+    if ticker and expiration and strike is not None and option_type:
+        try:
+            exp = dt.date.fromisoformat(str(expiration))
+            side = "C" if option_type.startswith("call") else "P"
+            return f"{ticker} {exp:%b} {exp.day} {float(strike):g}{side}"
+        except (TypeError, ValueError):
+            pass
+    return str((snapshot or {}).get("contract_symbol") or ticker or "OPTION")
+
+
 def close_reason_text(exit_record: dict[str, Any]) -> str:
     reason = str(exit_record.get("reason") or "")
     if reason == "take_profit":
@@ -286,6 +302,10 @@ def save_state(state: dict[str, Any]) -> None:
 
 def approval_id_for_alert(alert: dict[str, Any]) -> str:
     return "approval-" + stable_hash([validation_id(alert), "telegram"])[:12]
+
+
+def auto_paper_id_for_alert(alert: dict[str, Any]) -> str:
+    return "auto-" + stable_hash([validation_id(alert), "auto_paper"])[:12]
 
 
 def existing_card(approval_id: str) -> dict[str, Any] | None:
@@ -538,6 +558,151 @@ def send_approval_card(alert: dict[str, Any], snapshot: dict[str, Any], shadow_p
         card, _changed = send_card_to_configured_chats(card, config)
     append_jsonl(APPROVAL_CARDS_FILE, card)
     return card
+
+
+def default_auto_buy_command() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "command": "buy",
+        "contracts": None,
+        "risk_type": "percent",
+        "stop_percent": DEFAULT_STOP_PERCENT,
+        "take_percent": DEFAULT_TAKE_PERCENT,
+        "stop_price": None,
+        "take_price": None,
+        "used_default_contracts": True,
+        "used_default_risk": True,
+    }
+
+
+def take_plan_text(position: dict[str, Any]) -> str:
+    parts = []
+    for tranche in position.get("exit_plan") or []:
+        contracts = int(tranche.get("contracts") or 0)
+        take_percent = tranche.get("take_percent")
+        if contracts > 0 and take_percent is not None:
+            parts.append(f"{contracts} @ +{float(take_percent):g}%")
+    return ", ".join(parts) if parts else "n/a"
+
+
+def auto_buy_report_message(
+    alert: dict[str, Any],
+    snapshot: dict[str, Any],
+    position: dict[str, Any],
+    broker_audit: dict[str, Any],
+) -> str:
+    broker_status = broker_audit.get("status") or "unknown"
+    broker_reason = broker_audit.get("reason") or ""
+    broker_line = f"Broker: {broker_status}" + (f" ({broker_reason})" if broker_reason else "")
+    return "\n".join(
+        [
+            "AUTO PAPER BUY",
+            option_alert_label(alert, snapshot),
+            f"Bought {int(position.get('contracts') or 0)} @ {format_price(position.get('entry_price'))}",
+            f"Stop: -{float(position.get('stop_percent') or DEFAULT_STOP_PERCENT):g}%",
+            f"Takes: {take_plan_text(position)}",
+            broker_line,
+        ]
+    )
+
+
+def send_auto_buy_report(
+    alert: dict[str, Any],
+    snapshot: dict[str, Any],
+    position: dict[str, Any],
+    broker_audit: dict[str, Any],
+) -> dict[str, Any]:
+    config = load_bot_config(required=False)
+    message = auto_buy_report_message(alert, snapshot, position, broker_audit)
+    report = {
+        "event_type": "steve_auto_buy_report",
+        "auto_paper_id": auto_paper_id_for_alert(alert),
+        "position_id": position.get("position_id"),
+        "source_dedupe_key": alert.get("source_dedupe_key"),
+        "created_at": now_iso(),
+        "status": "telegram_disabled",
+        "reason": "missing_steve_trade_bot_env",
+        "message_text": message,
+        "broker_status": broker_audit.get("status"),
+        "broker_reason": broker_audit.get("reason"),
+        "telegram_messages": [],
+    }
+    if config is not None:
+        messages: list[dict[str, Any]] = []
+        for chat_id in configured_approval_chat_ids(config):
+            try:
+                response = send_telegram_message(config, message, chat_id=chat_id)
+                if not response.get("ok"):
+                    raise RuntimeError(f"Telegram returned non-ok response: {response}")
+                result = response.get("result", {})
+                chat = result.get("chat") or {}
+                messages.append(
+                    {
+                        "chat_id": str(chat.get("id") if chat.get("id") is not None else chat_id),
+                        "message_id": result.get("message_id"),
+                        "status": "sent",
+                        "reason": "",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                messages.append({"chat_id": str(chat_id), "message_id": None, "status": "send_failed", "reason": str(exc)})
+        report["telegram_messages"] = messages
+        successes = [row for row in messages if row.get("status") == "sent"]
+        failures = [row for row in messages if row.get("status") != "sent"]
+        if successes:
+            report["status"] = "partial_sent" if failures else "sent"
+            report["reason"] = "; ".join(
+                f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
+            )
+        elif messages:
+            report["status"] = "send_failed"
+            report["reason"] = "; ".join(
+                f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
+            )
+    append_jsonl(AUTO_BUY_REPORTS_FILE, report)
+    return report
+
+
+def auto_paper_position_exists(auto_paper_id: str) -> bool:
+    position_id = "human-" + stable_hash([auto_paper_id, "human"])[:16]
+    return any(row.get("position_id") == position_id for row in read_jsonl(HUMAN_POSITIONS_FILE))
+
+
+def auto_paper_buy(alert: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    auto_paper_id = auto_paper_id_for_alert(alert)
+    already_exists = auto_paper_position_exists(auto_paper_id)
+    card = {
+        "approval_id": auto_paper_id,
+        "alert": alert,
+        "snapshot": snapshot,
+    }
+    command = default_auto_buy_command()
+    position = create_human_position(card, command)
+    broker_audit = {"status": "skipped", "reason": "duplicate_auto_paper_position", "position_id": position.get("position_id")}
+    report: dict[str, Any] = {}
+    if not already_exists:
+        broker_audit = submit_option_paper_order(position)
+        report = send_auto_buy_report(alert, snapshot, position, broker_audit)
+    append_action(
+        {
+            "action": "auto_approved",
+            "approval_id": auto_paper_id,
+            "authorization_scope": "auto_non_hedge",
+            "position_id": position.get("position_id"),
+            "source_dedupe_key": alert.get("source_dedupe_key"),
+            "broker_status": broker_audit.get("status"),
+            "broker_reason": broker_audit.get("reason"),
+            "duplicate": already_exists,
+        }
+    )
+    return {
+        "auto_paper_id": auto_paper_id,
+        "position_id": position.get("position_id"),
+        "created": not already_exists,
+        "position": position,
+        "broker_audit": broker_audit,
+        "report": report,
+    }
 
 
 def parse_number(value: str) -> float:

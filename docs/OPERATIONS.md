@@ -72,6 +72,10 @@ scripts/uninstall_launch_agent.sh
 
 ## Telegram Approval Commands
 
+Non-hedge Steve option alerts are auto-routed to paper trading. The bot writes a local paper position, attempts the Alpaca paper option order when paper submission is enabled, and sends an `AUTO PAPER BUY` Telegram report to the configured approval destinations.
+
+Hedge alerts still require explicit human approval:
+
 ```text
 skip
 buy
@@ -86,6 +90,7 @@ buy contracts=1 stop_price=3.80 take_price=6.20
 ```sh
 tail -n 5 data/steve_approval_cards.jsonl
 tail -n 5 data/steve_approval_actions.jsonl
+tail -n 5 data/steve_auto_buy_reports.jsonl
 tail -n 5 data/steve_close_reports.jsonl
 tail -n 5 data/human_paper_positions.jsonl
 tail -n 5 data/human_paper_exits.jsonl

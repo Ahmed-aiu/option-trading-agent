@@ -61,6 +61,7 @@ def patch_runtime_paths(tmp_path: Path) -> None:
     steve_trade_bot.APPROVAL_CARDS_FILE = tmp_path / "steve_approval_cards.jsonl"
     steve_trade_bot.APPROVAL_ACTIONS_FILE = tmp_path / "steve_approval_actions.jsonl"
     steve_trade_bot.CLOSE_REPORTS_FILE = tmp_path / "steve_close_reports.jsonl"
+    steve_trade_bot.AUTO_BUY_REPORTS_FILE = tmp_path / "steve_auto_buy_reports.jsonl"
     steve_trade_bot.HUMAN_POSITIONS_FILE = tmp_path / "human_paper_positions.jsonl"
     steve_trade_bot.BOT_STATE_FILE = tmp_path / "steve_trade_bot_state.json"
 
@@ -146,12 +147,13 @@ def test_validation_and_approval() -> None:
                 {
                     "captured_at": "2026-05-08T13:09:00-04:00",
                     "dedupe_key": "screen-002",
-                    "body": "#CRWV MAY 8 113 call @ .88 Bought 10 #Lotto",
+                    "body": "#CRWV MAY 8 113 call @ .88 Bought 10 #hedge",
                 }
             )
         )[0]
         result = option_validation.handle_option_entry(alert, send_approval=True)
         assert result["shadow_position_created"] is True
+        assert result["route"] == "approval_required"
         cards = read_jsonl(steve_trade_bot.APPROVAL_CARDS_FILE)
         assert len(cards) == 1
         assert cards[0]["status"] == "telegram_disabled"
@@ -260,6 +262,69 @@ def test_validation_and_approval() -> None:
             config,
         )
         assert owner_dm["action"] == "duplicate_command"
+
+
+def test_non_hedge_auto_paper_buy() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        sent_messages: list[tuple[str, str]] = []
+        option_validation.enrich_option_alert = fake_snapshot
+        steve_trade_bot.load_bot_config = lambda required=False: steve_trade_bot.BotConfig(
+            token="test",
+            approval_chat_id="123456789",
+            owner_chat_id="123456789",
+            owner_user_id="123456789",
+            approval_chat_ids=("123456789", "-1001112223334"),
+        )
+        steve_trade_bot.send_telegram_message = lambda config, text, chat_id=None: (
+            sent_messages.append((str(chat_id or config.approval_chat_id), text))
+            or {"ok": True, "result": {"message_id": len(sent_messages), "chat": {"id": chat_id or config.approval_chat_id}}}
+        )
+        steve_trade_bot.submit_option_paper_order = lambda position: {
+            "status": "submitted",
+            "reason": "",
+            "position_id": position.get("position_id"),
+        }
+
+        alert = parsed_records(
+            parse_trade_alert(
+                {
+                    "captured_at": "2026-05-08T13:09:00-04:00",
+                    "dedupe_key": "screen-auto-001",
+                    "body": "#CRWV MAY 8 113 call @ .88 Bought 5 #swing",
+                }
+            )
+        )[0]
+        result = option_validation.handle_option_entry(alert, send_approval=True)
+        assert result["route"] == "auto_paper_buy"
+        assert result["approval_card"] == {}
+        assert result["auto_buy"]["created"] is True
+        assert read_jsonl(steve_trade_bot.APPROVAL_CARDS_FILE) == []
+
+        positions = read_jsonl(steve_trade_bot.HUMAN_POSITIONS_FILE)
+        assert len(positions) == 1
+        assert positions[0]["contracts"] == 5
+        assert positions[0]["stop_percent"] == 35.0
+        assert positions[0]["take_percent"] == 80.0
+        assert positions[0]["exit_plan"] == [
+            {"action": "sell", "contracts": 2, "take_percent": 80.0, "take_price": 1.58},
+            {"action": "sell", "contracts": 1, "take_percent": 120.0, "take_price": 1.94},
+            {"action": "sell", "contracts": 2, "take_percent": 200.0, "take_price": 2.64},
+        ]
+
+        reports = read_jsonl(steve_trade_bot.AUTO_BUY_REPORTS_FILE)
+        assert len(reports) == 1
+        assert reports[0]["status"] == "sent"
+        assert "AUTO PAPER BUY" in reports[0]["message_text"]
+        assert "Bought 5 @ 0.88" in reports[0]["message_text"]
+        assert "Takes: 2 @ +80%, 1 @ +120%, 2 @ +200%" in reports[0]["message_text"]
+        assert len(sent_messages) == 2
+
+        duplicate = option_validation.handle_option_entry(alert, send_approval=True)
+        assert duplicate["auto_buy"]["created"] is False
+        assert len(read_jsonl(steve_trade_bot.HUMAN_POSITIONS_FILE)) == 1
+        assert len(read_jsonl(steve_trade_bot.AUTO_BUY_REPORTS_FILE)) == 1
 
 
 def test_exit_plan_contract_allocation() -> None:
@@ -655,6 +720,7 @@ def test_live_pipeline_heartbeat() -> None:
 def main() -> int:
     test_parser()
     test_validation_and_approval()
+    test_non_hedge_auto_paper_buy()
     test_exit_plan_contract_allocation()
     test_multi_destination_approval_cards()
     test_close_report_message_and_delivery()

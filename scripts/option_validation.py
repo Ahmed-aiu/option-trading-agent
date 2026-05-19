@@ -41,6 +41,12 @@ def is_option_exit(alert: dict[str, Any]) -> bool:
     )
 
 
+def is_hedge_alert(alert: dict[str, Any]) -> bool:
+    tags = {str(tag).lower() for tag in (alert.get("tags") or [])}
+    primary_tag = str(alert.get("primary_tag") or "").lower()
+    return primary_tag == "hedge" or "hedge" in tags
+
+
 def validation_id(alert: dict[str, Any]) -> str:
     return "val-" + stable_hash(
         [
@@ -125,16 +131,24 @@ def handle_option_entry(alert: dict[str, Any], send_approval: bool = True) -> di
     position, created = create_shadow_position(alert, snapshot)
     append_snapshot(alert, snapshot, position.get("position_id"))
     card: dict[str, Any] | None = None
+    auto_buy: dict[str, Any] | None = None
     if send_approval:
-        from steve_trade_bot import send_approval_card
+        if is_hedge_alert(alert):
+            from steve_trade_bot import send_approval_card
 
-        card = send_approval_card(alert, snapshot, position)
+            card = send_approval_card(alert, snapshot, position)
+        else:
+            from steve_trade_bot import auto_paper_buy
+
+            auto_buy = auto_paper_buy(alert, snapshot)
     return {
         "event_type": "option_entry_validation_result",
         "validation_id": validation_id(alert),
         "position_id": position.get("position_id"),
         "shadow_position_created": created,
+        "route": "approval_required" if is_hedge_alert(alert) else "auto_paper_buy",
         "approval_card": card or {},
+        "auto_buy": auto_buy or {},
         "snapshot_status": (snapshot.get("option_quote") or {}).get("status"),
     }
 

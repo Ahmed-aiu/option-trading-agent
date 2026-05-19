@@ -193,6 +193,7 @@ def atomic_touch_jsonl_files() -> None:
         DATA_DIR / "steve_approval_cards.jsonl",
         DATA_DIR / "steve_approval_actions.jsonl",
         DATA_DIR / "steve_close_reports.jsonl",
+        DATA_DIR / "steve_auto_buy_reports.jsonl",
         DATA_DIR / "human_paper_positions.jsonl",
         DATA_DIR / "human_paper_exits.jsonl",
         DATA_DIR / "option_validation_errors.jsonl",

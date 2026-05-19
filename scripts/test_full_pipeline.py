@@ -50,6 +50,7 @@ def main() -> int:
         "alpaca_dry_runs",
         "option_shadow_positions",
         "option_approval_cards",
+        "option_auto_buys",
         "option_exits",
         "option_validation_errors",
     ):
@@ -64,7 +65,8 @@ def main() -> int:
         "blocked": 1,
         "alpaca_dry_runs": 1,
         "option_shadow_positions": 1,
-        "option_approval_cards": 1,
+        "option_approval_cards": 0,
+        "option_auto_buys": 1,
         "option_exits": 0,
         "option_validation_errors": 0,
     }

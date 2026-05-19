@@ -98,7 +98,7 @@ def main() -> int:
                 "capture_written={written} duplicates={duplicates} raw_new={raw_new} "
                 "parsed={parsed} rejected={rejected} allowed={allowed} blocked={blocked} dry_runs={dry_runs} "
                 "option_shadow={option_shadow} option_cards={option_cards} telegram_actions={telegram_actions} "
-                "option_snapshots={option_snapshots} human_exits={human_exits}".format(
+                "option_auto_buys={option_auto_buys} option_snapshots={option_snapshots} human_exits={human_exits}".format(
                     written=written,
                     duplicates=duplicates,
                     raw_new=counts["raw_new"],
@@ -109,6 +109,7 @@ def main() -> int:
                     dry_runs=counts["alpaca_dry_runs"],
                     option_shadow=counts.get("option_shadow_positions", 0),
                     option_cards=counts.get("option_approval_cards", 0),
+                    option_auto_buys=counts.get("option_auto_buys", 0),
                     telegram_actions=telegram_counts.get("actions", 0),
                     option_snapshots=option_counts.get("snapshots", 0),
                     human_exits=option_counts.get("human_exits", 0),
