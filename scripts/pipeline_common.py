@@ -183,6 +183,7 @@ def project_path(*parts: str) -> Path:
 def atomic_touch_jsonl_files() -> None:
     for path in [
         DATA_DIR / "raw_notifications.jsonl",
+        DATA_DIR / "discord_text_backfills.jsonl",
         DATA_DIR / "parsed_alerts.jsonl",
         DATA_DIR / "rejected_alerts.jsonl",
         DATA_DIR / "trade_decisions.jsonl",

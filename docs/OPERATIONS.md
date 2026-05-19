@@ -64,6 +64,46 @@ tail -n 20 data/live_pipeline_heartbeats.jsonl
 
 If the heartbeat was fresh but `data/raw_notifications.jsonl` has no matching Discord row, the miss happened before parsing/Telegram, usually because Discord/macOS did not emit or persist a notification body for the channel message.
 
+## Backfill Missed Discord Text
+
+When Steve messages are visible in Discord but were missed by macOS notifications, paste the copied Discord text into the audit backfill path:
+
+```sh
+pbpaste | python3 scripts/backfill_steve_text.py --mode audit --source short-term-call-outs
+```
+
+Audit mode creates parsed alerts, shadow positions, and Steve exit records without sending approval cards or submitting paper orders. Use this for stale missed alerts. The raw copied text is also logged to `data/discord_text_backfills.jsonl`.
+
+Near-real-time browser capture can use live mode only when the text is fresh enough to trade:
+
+```sh
+pbpaste | python3 scripts/backfill_steve_text.py --mode live --source browser_poll
+```
+
+Live mode writes records into `data/raw_notifications.jsonl`, so normal routing applies: non-hedge alerts can auto-paper-buy, while hedge alerts still request Telegram approval.
+
+## Chrome Visible Discord Capture
+
+For a second live capture source, keep the target Discord channel open in Chrome and enable:
+
+```text
+Chrome menu -> View -> Developer -> Allow JavaScript from Apple Events
+```
+
+Then run a one-shot audit read:
+
+```sh
+python3 scripts/discord_chrome_visible_capture.py --once --mode audit
+```
+
+Run live polling only when the visible channel is current and fresh enough to trade:
+
+```sh
+python3 scripts/discord_chrome_visible_capture.py --mode live --interval 5
+```
+
+This reader only sees messages currently present in the active Chrome Discord tab. It is a fallback for missed macOS notifications, not a replacement for an official Discord bot/webhook.
+
 Uninstall:
 
 ```sh

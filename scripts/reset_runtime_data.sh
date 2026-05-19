@@ -7,6 +7,7 @@ mkdir -p "$ARCHIVE_DIR"
 
 for file in \
   raw_notifications.jsonl \
+  discord_text_backfills.jsonl \
   parsed_alerts.jsonl \
   rejected_alerts.jsonl \
   trade_decisions.jsonl \

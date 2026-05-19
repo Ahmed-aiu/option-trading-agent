@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 import alpaca_options
+import backfill_steve_text
 import notification_watcher
 import option_validation
 import run_live_pipeline
@@ -634,6 +635,45 @@ def test_pipeline_processes_close_reply_as_option_exit() -> None:
             run_pipeline_once.write_openclaw_summary = original_summary
 
 
+def test_backfill_text_audit_matches_contextual_exits() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        original_data_dir = backfill_steve_text.DATA_DIR
+        original_backfills = backfill_steve_text.BACKFILLS_FILE
+        original_enrich = option_validation.enrich_option_alert
+        try:
+            backfill_steve_text.DATA_DIR = tmp_path
+            backfill_steve_text.BACKFILLS_FILE = tmp_path / "discord_text_backfills.jsonl"
+            option_validation.enrich_option_alert = fake_snapshot
+            text = "\n".join(
+                [
+                    "OTWSteve #XOM MAY 22 160 call @ 1.62 Bought 10 #swing",
+                    "OTWSteve 10:33 AM",
+                    "sold 5 @ 3.35",
+                    "OTWSteve #CVX May 22 192.50 call @ 1.54 bought 5 #swing #Lotto",
+                    "OTWSteve 10:34 AM",
+                    "sold 4 @ 4.20",
+                ]
+            )
+            records = backfill_steve_text.build_raw_records(text, "test-backfill")
+            assert len(records) == 4
+            counts = backfill_steve_text.process_audit(records)
+            assert counts["entries"] == 2
+            assert counts["exits"] == 2
+            exits = read_jsonl(option_validation.STEVE_EXITS_FILE)
+            assert exits[0]["ticker"] == "XOM"
+            assert exits[0]["contracts"] == 5
+            assert exits[0]["matched_shadow_position_id"]
+            assert exits[1]["ticker"] == "CVX"
+            assert exits[1]["contracts"] == 4
+            assert exits[1]["matched_shadow_position_id"]
+        finally:
+            backfill_steve_text.DATA_DIR = original_data_dir
+            backfill_steve_text.BACKFILLS_FILE = original_backfills
+            option_validation.enrich_option_alert = original_enrich
+
+
 def test_option_order_payload() -> None:
     payload = alpaca_options.build_option_order_payload(
         {
@@ -727,6 +767,7 @@ def main() -> int:
     test_human_exit_rules_and_steve_catch_up()
     test_option_exit_reply_matches_shadow_context()
     test_pipeline_processes_close_reply_as_option_exit()
+    test_backfill_text_audit_matches_contextual_exits()
     test_option_order_payload()
     test_watcher_steve_filters()
     test_live_pipeline_heartbeat()
