@@ -50,6 +50,18 @@ def useful_lines(text: str) -> list[str]:
     return lines
 
 
+def unique_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for record in records:
+        key = str(record.get("dedupe_key") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
+
+
 def parsed_items_for_body(body: str, dedupe_key: str) -> list[dict[str, Any]]:
     try:
         value = parse_trade_alert(
@@ -100,7 +112,7 @@ def build_raw_records(text: str, source: str) -> list[dict[str, Any]]:
                 "dedupe_key": "ui-" + stable_hash([source, body])[:24],
             }
         )
-    return records
+    return unique_records(records)
 
 
 def existing_keys(path: Path) -> set[str]:
@@ -113,6 +125,7 @@ def process_audit(records: list[dict[str, Any]]) -> dict[str, int]:
     for raw in records:
         if raw["dedupe_key"] in seen_backfills:
             continue
+        seen_backfills.add(raw["dedupe_key"])
         append_jsonl(BACKFILLS_FILE, raw)
         counts["raw"] += 1
         try:
@@ -151,7 +164,12 @@ def main() -> int:
         return 0
     if args.mode == "live":
         existing = existing_keys(DATA_DIR / "raw_notifications.jsonl")
-        new_records = [record for record in records if record["dedupe_key"] not in existing]
+        new_records = []
+        for record in records:
+            if record["dedupe_key"] in existing:
+                continue
+            existing.add(record["dedupe_key"])
+            new_records.append(record)
         for record in new_records:
             append_jsonl(DATA_DIR / "raw_notifications.jsonl", record)
         counts = process_raw_notifications(read_jsonl(DATA_DIR / "raw_notifications.jsonl"))

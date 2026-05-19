@@ -9,6 +9,7 @@ from pathlib import Path
 
 import alpaca_options
 import backfill_steve_text
+import discord_chrome_visible_capture
 import notification_watcher
 import option_validation
 import run_live_pipeline
@@ -649,7 +650,9 @@ def test_backfill_text_audit_matches_contextual_exits() -> None:
             text = "\n".join(
                 [
                     "OTWSteve #XOM MAY 22 160 call @ 1.62 Bought 10 #swing",
+                    "OTWSteve #XOM MAY 22 160 call @ 1.62 Bought 10 #swing",
                     "OTWSteve 10:33 AM",
+                    "sold 5 @ 3.35",
                     "sold 5 @ 3.35",
                     "OTWSteve #CVX May 22 192.50 call @ 1.54 bought 5 #swing #Lotto",
                     "OTWSteve 10:34 AM",
@@ -672,6 +675,30 @@ def test_backfill_text_audit_matches_contextual_exits() -> None:
             backfill_steve_text.DATA_DIR = original_data_dir
             backfill_steve_text.BACKFILLS_FILE = original_backfills
             option_validation.enrich_option_alert = original_enrich
+
+
+def test_chrome_visible_capture_filters_history_by_default() -> None:
+    today = discord_chrome_visible_capture.today_label()
+    snapshot = {
+        "messages": [
+            {"text": "Friday, May 15, 2026 at 3:37 PM\n#TSLA May 15 425 call @ 4.75 bought 1 #lotto"},
+            {"text": f"{today} at 3:19 PM\n#CVX May 22 200 call @ 1.59 Bought 3 #Lotto"},
+        ]
+    }
+    filtered = discord_chrome_visible_capture.filter_visible_messages(snapshot, include_history=False)
+    assert len(filtered) == 1
+    assert "CVX" in filtered[0]["text"]
+    assert len(discord_chrome_visible_capture.filter_visible_messages(snapshot, include_history=True)) == 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_state = discord_chrome_visible_capture.STATE_FILE
+        try:
+            discord_chrome_visible_capture.STATE_FILE = Path(tmp) / "chrome_state.json"
+            state = discord_chrome_visible_capture.mark_messages_seen(filtered)
+            assert state["seen_count"] == 1
+            assert discord_chrome_visible_capture.unseen_messages(filtered) == []
+        finally:
+            discord_chrome_visible_capture.STATE_FILE = original_state
 
 
 def test_option_order_payload() -> None:
@@ -768,6 +795,7 @@ def main() -> int:
     test_option_exit_reply_matches_shadow_context()
     test_pipeline_processes_close_reply_as_option_exit()
     test_backfill_text_audit_matches_contextual_exits()
+    test_chrome_visible_capture_filters_history_by_default()
     test_option_order_payload()
     test_watcher_steve_filters()
     test_live_pipeline_heartbeat()

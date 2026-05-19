@@ -99,10 +99,13 @@ python3 scripts/discord_chrome_visible_capture.py --once --mode audit
 Run live polling only when the visible channel is current and fresh enough to trade:
 
 ```sh
+python3 scripts/discord_chrome_visible_capture.py --mark-existing
 python3 scripts/discord_chrome_visible_capture.py --mode live --interval 5
 ```
 
-This reader only sees messages currently present in the active Chrome Discord tab. It is a fallback for missed macOS notifications, not a replacement for an official Discord bot/webhook.
+The `--mark-existing` step seeds `data/discord_chrome_visible_capture_state.json` so the first live loop does not trade older messages already visible in the channel. By default this reader only processes visible messages that contain today's full Discord date label. This avoids accidentally trading old visible history. Use `--include-history` only for audit/backfill work, not live trading.
+
+Run this reader in a foreground terminal session. macOS may allow Chrome Apple Events from Terminal while blocking the same script under LaunchAgent. This reader only sees messages currently present in the active Chrome Discord tab. It is a fallback for missed macOS notifications, not a replacement for an official Discord bot/webhook.
 
 Uninstall:
 
