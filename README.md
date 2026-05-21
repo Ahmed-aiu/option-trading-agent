@@ -1,19 +1,23 @@
-# Trading Alert Executor
+# Option Trading Agent
 
-Local macOS capture and paper-trading decision pipeline for Discord desktop stock and option alert notifications.
+Local paper-only options alert validation agent for Steve-style Discord alerts. It captures alert messages from local Discord/macOS sources, parses option entries and exits, enriches them with Alpaca-first market data, routes Telegram approval or auto paper entries, records paper outcomes, and runs nightly source-of-truth reviews so the system can improve after each trading day.
 
-This project reads local macOS notification artifacts when macOS permits it, stores every matching raw Discord notification before parsing, parses strict trade-alert formats into JSON, runs a paper-only risk gate, and writes local audit files for OpenClaw.
+This is not an investment-advice or live-trading project. It is built to collect evidence: what Steve sent, what the bot captured, what got parsed, what paper trades were opened/closed, what Alpaca accepted or rejected, and where the pipeline failed.
 
 ## What It Does
 
 - Captures recent Discord notifications from local macOS Notification Center databases when readable.
-- Provides a read-only Accessibility snapshot fallback for troubleshooting visible UI state.
+- Captures visible Steve messages from logged-in Chrome Discord channel tabs as a robust browser fallback.
 - Stores raw notification records in append-only JSONL.
-- Parses deterministic stock-alert patterns into structured JSON.
-- Rejects ambiguous alerts and missing-risk alerts.
-- Writes paper-only trade decisions and OpenClaw markdown summaries.
-- Sends Steve-style option alerts to a dedicated Telegram approval bot.
-- Tracks shadow buy-all option outcomes and human-approved local paper trades.
+- Parses deterministic Steve option entries, partial exits, full closes, contextual stops, and some stock-alert patterns into structured JSON.
+- Rejects unsupported or ambiguous messages with exact audit reasons.
+- Creates shadow "buy all Steve alerts" positions for validation.
+- Auto-routes non-hedge option alerts into local paper trades.
+- Sends hedge or ambiguous alerts to a dedicated Telegram approval bot.
+- Tracks option quote snapshots, local paper positions, exits, P/L, and Steve close behavior.
+- Attempts Alpaca paper option orders only when explicitly enabled.
+- Sends Telegram auto-buy, close, health, and daily P/L reports.
+- Runs health monitors and nightly source-of-truth reviews.
 - Replays JSONL files for parser/risk testing.
 
 ## What It Does Not Do
@@ -30,14 +34,61 @@ This project reads local macOS notification artifacts when macOS permits it, sto
 
 This is a local paper/simulation pipeline. It is designed to fail closed: if an alert is ambiguous, incomplete, duplicated, too old, unsupported, or outside configured risk limits, it is rejected or blocked. Broker execution is restricted to Alpaca paper endpoints and disabled by default.
 
+## Current MVP Behavior
+
+For option alerts, Steve's message is the trigger and the local paper ledger is the validation source of truth.
+
+```text
+Discord Steve alert
+ -> notification watcher and/or Chrome browser watcher
+ -> raw_notifications.jsonl
+ -> parse_alert.py
+ -> option_validation.py
+ -> steve_trade_bot.py
+ -> Telegram report/approval
+ -> human_paper_positions.jsonl and human_paper_exits.jsonl
+ -> Alpaca paper order audit when enabled
+ -> nightly_review.py after close
+```
+
+Default paper routing:
+
+- `#hedge`: requires Telegram approval because it may not make sense without the portfolio context being hedged.
+- Non-hedge options such as `#swing`, `#lotto`, or no tag: auto paper buy using the alert contract count.
+- Default stop: `-35%`.
+- Default take-profit plan: +80%, +120%, +200% ladder.
+- Steve partial closes are cumulative catch-up exits. The local paper ledger only sells additional contracts when Steve has closed more than the bot already closed through targets/stops.
+
+## Capture Strategy
+
+There are two live capture methods:
+
+- **macOS notifications**: fast when Discord/macOS persists the notification body, but can silently miss messages.
+- **Chrome browser watcher**: reads visible logged-in Discord channel tabs through Apple Events, writes fresh Steve messages into the same raw pipeline, and is currently the preferred primary source based on the nightly scorecard.
+
+The nightly review compares methods by capture rate, latency, and duplicates. If browser capture keeps outperforming notifications, keep it primary and use notifications as backup/dedupe evidence.
+
 ## Repo Map
 
 - `AGENTS.md`: short onboarding notes for Codex/LLM coding agents.
+- `SKILL.md`: nightly recursive improvement operating guide for Codex/LLM agents.
 - `docs/ARCHITECTURE.md`: pipeline, ledgers, and module responsibilities.
 - `docs/OPERATIONS.md`: local runbook for capture, Telegram approvals, and reports.
+- `docs/EXIT_STRATEGY.md`: current exit behavior and next policies to test.
 - `docs/GITHUB_PUBLISHING.md`: safe GitHub publishing checklist.
 - `.env.example`: local environment variable template.
 - `config/watcher.example.yaml`: sanitized watcher template. Copy it to ignored `config/watcher.yaml` for local use.
+
+## LLM/Codex Onboarding
+
+Future coding agents should read these first:
+
+1. `AGENTS.md` for hard safety rules and key files.
+2. `SKILL.md` for the nightly recursive improvement process.
+3. `docs/ARCHITECTURE.md` for ledgers and module responsibilities.
+4. `docs/OPERATIONS.md` for local run/monitoring commands.
+
+Important constraint: preserve paper-only behavior unless the user explicitly requests otherwise and tests are added for the new boundary.
 
 ## macOS Setup
 
@@ -59,6 +110,14 @@ cp .env.example .env.local
 cp config/watcher.example.yaml config/watcher.yaml
 python3 scripts/test_pipeline.py
 python3 scripts/replay_alerts.py --input tests/sample_alerts.jsonl --expect tests/expected_parsed.jsonl --dry-run
+```
+
+Steve options MVP test:
+
+```sh
+python3 scripts/test_steve_options_mvp.py
+python3 scripts/test_full_pipeline.py
+python3 -m py_compile scripts/*.py
 ```
 
 Expected local test counts:
@@ -103,7 +162,17 @@ It keeps an in-memory dedupe set and reloads previous dedupe keys on restart, so
 
 ## Parser
 
-Examples supported in v1:
+Steve option examples supported:
+
+```text
+#QQQ May 15 710 put @ 5.86 Bought 4 #hedge
+#MSFT July 17 475 call @ 6.15 Bought 6 #swing
+sold 2 @ 4.11
+Closed @ 7.54
+stopped out
+```
+
+Stock examples supported:
 
 ```text
 BUY TSLA over 182.50 stop 179.80 target 188
@@ -147,6 +216,14 @@ Run capture and processing continuously:
 ```sh
 python3 scripts/run_live_pipeline.py
 ```
+
+The browser watcher should run in a foreground Terminal session during market hours:
+
+```sh
+scripts/run_browser_watcher_foreground.sh
+```
+
+It uses `caffeinate`, polls every 5 seconds by default, and writes browser health records that the health monitor checks.
 
 Archive and clear runtime JSONL files before a clean market-hours test:
 
@@ -224,6 +301,30 @@ Generate a daily validation report:
 ```sh
 python3 scripts/option_validation.py daily-summary
 ```
+
+## Health And Nightly Review
+
+The health monitor pinpoints failures by stage:
+
+```sh
+python3 scripts/pipeline_health_monitor.py --once --no-telegram
+```
+
+The nightly review treats Chrome Discord history as source of truth and compares it against every local ledger:
+
+```sh
+python3 scripts/nightly_review.py --refresh-browser --send-telegram --print-json
+```
+
+It writes:
+
+```text
+data/nightly_reviews/YYYY-MM-DD.json
+data/nightly_reviews/YYYY-MM-DD.md
+data/nightly_review_reports.jsonl
+```
+
+The nightly report includes a capture-method scorecard, issue list, recommended next actions, and daily P/L context. `SKILL.md` defines how Codex should use that report to make paper-only improvements for the next session.
 
 ## OpenClaw Trigger
 

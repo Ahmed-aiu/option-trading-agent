@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.openclaw.discord-browser-watcher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON_BIN__</string>
+    <string>__PROJECT_DIR__/scripts/discord_browser_channel_watcher.py</string>
+    <string>--interval</string>
+    <string>5</string>
+    <string>--timeout</string>
+    <string>30</string>
+    <string>--retries</string>
+    <string>2</string>
+    <string>--market-hours-only</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__PROJECT_DIR__/logs/discord_browser_watcher.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_DIR__/logs/discord_browser_watcher.launchd.err.log</string>
+</dict>
+</plist>

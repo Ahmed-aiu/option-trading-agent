@@ -13,12 +13,16 @@ This project validates Steve-style Discord option alerts with local paper tradin
 - Broker-side paper buys can be attempted when enabled; broker-side paper sells are not yet wired as the source of truth.
 - Runtime files are append-only JSONL ledgers for auditability.
 - Missing data is logged instead of guessed.
+- Discord capture is local notification/browser reading only. The system does not use Discord user tokens or private Discord APIs.
 
 ## Pipeline
 
 ```text
 notification_watcher.py
   captures matching macOS Discord notifications
+
+discord_browser_channel_watcher.py
+  fallback-captures visible Steve messages from logged-in Chrome Discord channel tabs
 
 run_pipeline_once.py
   dedupes raw records and routes parsed entries/exits
@@ -44,9 +48,35 @@ alpaca_options.py
   builds OCC option symbols
   fetches Alpaca option/stock data
   optionally attempts paper option order submission
+
+pipeline_health_monitor.py
+  pinpoints failures across notification, browser, raw, parse, routing, Telegram, and broker stages
+
+nightly_review.py
+  uses browser Discord truth after close to reconcile the full day and produce improvement actions
 ```
 
 `run_live_pipeline.py` runs the whole loop continuously and also polls Telegram replies.
+
+## Capture Sources
+
+The pipeline intentionally keeps more than one capture source because macOS and Discord notification behavior is not stable enough to trust blindly.
+
+- `notification_watcher.py` reads local macOS Notification Center records when macOS permits it.
+- `discord_browser_channel_watcher.py` reads visible logged-in Chrome Discord channel tabs through Apple Events.
+- Both sources write normalized raw records to `raw_notifications.jsonl`.
+- Downstream dedupe is based on canonical option identity and source dedupe keys so the same alert can arrive from both methods without creating duplicate positions.
+
+The nightly review computes a capture-method scorecard:
+
+- matched Steve truth events
+- capture rate
+- average/max latency
+- same-source duplicates
+- cross-source duplicates
+- recommended primary source and browser polling interval
+
+Use the scorecard rather than intuition when changing capture priority or polling frequency.
 
 ## Data Model
 
@@ -55,6 +85,8 @@ All state is append-only JSONL. This makes the system easy to debug with `tail`,
 Core ledgers:
 
 - `raw_notifications.jsonl`: captured local notifications.
+- `discord_browser_messages.jsonl`: browser-visible Steve messages and derived raw keys.
+- `discord_browser_health.jsonl`: browser capture health history.
 - `processed_notifications.jsonl`: raw notification dedupe ledger.
 - `parsed_alerts.jsonl`: normalized alerts and exits.
 - `shadow_option_positions.jsonl`: Steve buy-all validation positions.
@@ -67,6 +99,9 @@ Core ledgers:
 - `human_paper_positions.jsonl`: approved human paper entries.
 - `human_paper_exits.jsonl`: local paper exits from targets, stops, or Steve catch-up.
 - `orders_paper.jsonl`: Alpaca paper order attempts or blocked attempts.
+- `pipeline_health_checks.jsonl`: exact stage health checks.
+- `pipeline_health_alerts.jsonl`: Telegram health alert delivery audit.
+- `nightly_review_reports.jsonl`: post-market review summaries and recommended improvements.
 
 ## Exit Logic
 
@@ -96,3 +131,15 @@ Ignored local config:
 - `.env.local`
 
 To set up a new machine, copy `config/watcher.example.yaml` to `config/watcher.yaml`, then fill in local Discord channel IDs and alert author names.
+
+## LLM/Codex Operating Context
+
+Human readers should start with `README.md` and `docs/OPERATIONS.md`.
+
+LLM agents should start with:
+
+- `AGENTS.md` for hard safety rules.
+- `SKILL.md` for the recursive nightly improvement loop.
+- This architecture document for module boundaries and ledgers.
+
+Any automated improvement should preserve paper-only execution, add or update tests, and leave enough JSONL/Markdown audit data to explain the next day's behavior.

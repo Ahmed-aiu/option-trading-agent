@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from alpaca_options import enrich_option_alert, option_symbol
+from alpaca_options import enrich_option_alert, option_symbol, submit_option_paper_sell_order
 from pipeline_common import DATA_DIR, append_jsonl, now_iso, parse_datetime, read_jsonl, stable_hash
 
 
@@ -18,6 +18,7 @@ STEVE_EXITS_FILE = DATA_DIR / "steve_option_exits.jsonl"
 HUMAN_POSITIONS_FILE = DATA_DIR / "human_paper_positions.jsonl"
 HUMAN_EXITS_FILE = DATA_DIR / "human_paper_exits.jsonl"
 DAILY_SUMMARIES_FILE = DATA_DIR / "daily_option_summaries.jsonl"
+DAILY_PL_REPORTS_FILE = DATA_DIR / "daily_pl_reports.jsonl"
 
 
 def is_option_entry(alert: dict[str, Any]) -> bool:
@@ -342,6 +343,10 @@ def human_positions_for_shadow(shadow_position: dict[str, Any]) -> list[dict[str
     return positions
 
 
+def has_open_human_position_for_shadow(shadow_position: dict[str, Any], exit_rows: list[dict[str, Any]] | None = None) -> bool:
+    return any(human_remaining_contracts(position, exit_rows) > 0 for position in human_positions_for_shadow(shadow_position))
+
+
 def append_human_exit(
     position: dict[str, Any],
     contracts: int,
@@ -387,6 +392,16 @@ def append_human_exit(
     }
     if extra:
         record.update(extra)
+    broker_audit = submit_option_paper_sell_order(position, quantity, reason, exit_id)
+    broker_response = broker_audit.get("response") or {}
+    record.update(
+        {
+            "broker_status": broker_audit.get("status"),
+            "broker_reason": broker_audit.get("reason"),
+            "broker_order_id": broker_response.get("id"),
+            "broker_client_order_id": broker_response.get("client_order_id") or (broker_audit.get("payload") or {}).get("client_order_id"),
+        }
+    )
     append_jsonl(HUMAN_EXITS_FILE, record)
     try:
         from steve_trade_bot import send_human_exit_report
@@ -635,16 +650,90 @@ def write_openclaw_daily_summary(summary: dict[str, Any], metrics: list[dict[str
     (workspace_dir / "latest_steve_options_validation.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def compute_daily_pl_summary(day: str | None = None) -> dict[str, Any]:
+    target_day = day or date_key(now_iso())
+    all_positions = read_jsonl(HUMAN_POSITIONS_FILE)
+    all_exits = read_jsonl(HUMAN_EXITS_FILE)
+    exits_today = [row for row in all_exits if date_key(row.get("recorded_at")) == target_day]
+    snapshots = read_jsonl(QUOTE_SNAPSHOTS_FILE)
+    realized_pnl = sum(float(row.get("pnl_dollars") or 0) for row in exits_today)
+    open_pnl = 0.0
+    open_positions = 0
+    marked_positions = 0
+    for position in all_positions:
+        remaining = human_remaining_contracts(position, all_exits)
+        if remaining <= 0:
+            continue
+        open_positions += 1
+        snapshot = latest_snapshot_for_human_position(position, snapshots)
+        current_price = price_from_snapshot(snapshot or {})
+        entry_price = safe_float(position.get("entry_price"))
+        if current_price is None or entry_price is None:
+            continue
+        marked_positions += 1
+        open_pnl += (current_price - entry_price) * remaining * 100
+    summary = {
+        "event_type": "daily_paper_pl_summary",
+        "day": target_day,
+        "generated_at": now_iso(),
+        "realized_pnl": realized_pnl,
+        "open_pnl": open_pnl,
+        "total_pnl": realized_pnl + open_pnl,
+        "open_positions": open_positions,
+        "marked_open_positions": marked_positions,
+        "exits_today": len(exits_today),
+        "contracts_closed_today": sum(int(row.get("contracts") or 0) for row in exits_today),
+    }
+    return summary
+
+
+def daily_pl_summary_exists(day: str) -> bool:
+    return any(row.get("day") == day and row.get("status") in {"sent", "partial_sent", "telegram_disabled"} for row in read_jsonl(DAILY_PL_REPORTS_FILE))
+
+
+def send_daily_pl_summary_once(tz_name: str = "America/Detroit", force: bool = False) -> dict[str, Any]:
+    now = parse_datetime(now_iso(tz_name))
+    if now is None:
+        return {"sent": False, "reason": "clock_unavailable"}
+    if now.weekday() >= 5 and not force:
+        return {"sent": False, "reason": "weekend"}
+    due_at = now.replace(hour=16, minute=10, second=0, microsecond=0)
+    if now < due_at and not force:
+        return {"sent": False, "reason": "not_due"}
+    day = now.date().isoformat()
+    if daily_pl_summary_exists(day):
+        return {"sent": False, "reason": "already_sent", "day": day}
+    summary = compute_daily_pl_summary(day)
+    try:
+        from steve_trade_bot import send_daily_pl_report
+
+        report = send_daily_pl_report(summary)
+    except Exception as exc:  # noqa: BLE001
+        report = {
+            "event_type": "daily_pl_report",
+            "day": day,
+            "created_at": now_iso(tz_name),
+            "status": "send_failed",
+            "reason": f"{type(exc).__name__}:{exc}",
+            "summary": summary,
+            "telegram_messages": [],
+        }
+        append_jsonl(DAILY_PL_REPORTS_FILE, report)
+    return {"sent": True, "day": day, "report": report}
+
+
 def track_open_positions_once() -> dict[str, int]:
     counts = {"open_positions": 0, "snapshots": 0, "skipped_not_due": 0, "skipped_stale": 0, "human_exits": 0}
     existing_snapshots = read_jsonl(QUOTE_SNAPSHOTS_FILE)
+    human_exit_rows = read_jsonl(HUMAN_EXITS_FILE)
     now_dt = parse_datetime(now_iso())
     for position in open_shadow_positions():
         counts["open_positions"] += 1
         opened_at = parse_datetime(position.get("opened_at"))
         if opened_at is not None and now_dt is not None:
             age_seconds = (now_dt - opened_at).total_seconds()
-            if age_seconds > 90 * 60:
+            has_open_human = has_open_human_position_for_shadow(position, human_exit_rows)
+            if age_seconds > 90 * 60 and not has_open_human:
                 counts["skipped_stale"] += 1
                 continue
             desired_interval = 15 if age_seconds <= 10 * 60 else 60
@@ -679,11 +768,20 @@ def main() -> int:
     sub.add_parser("track-once")
     summary = sub.add_parser("daily-summary")
     summary.add_argument("--day")
+    daily_pl = sub.add_parser("daily-pl")
+    daily_pl.add_argument("--day")
+    daily_pl.add_argument("--send", action="store_true")
+    daily_pl.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if args.command == "track-once":
         print(json.dumps(track_open_positions_once(), sort_keys=True))
     elif args.command == "daily-summary":
         print(json.dumps(generate_daily_summary(args.day), sort_keys=True))
+    elif args.command == "daily-pl":
+        if args.send:
+            print(json.dumps(send_daily_pl_summary_once(force=args.force), sort_keys=True))
+        else:
+            print(json.dumps(compute_daily_pl_summary(args.day), sort_keys=True))
     return 0
 
 

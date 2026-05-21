@@ -84,13 +84,53 @@ Live mode writes records into `data/raw_notifications.jsonl`, so normal routing 
 
 ## Chrome Visible Discord Capture
 
-For a second live capture source, keep the target Discord channel open in Chrome and enable:
+For a second live capture source, keep Chrome logged into Discord and enable:
 
 ```text
 Chrome menu -> View -> Developer -> Allow JavaScript from Apple Events
 ```
 
-Then run a one-shot audit read:
+The preferred browser fallback is the multi-channel watcher. It opens/uses the configured Discord channel tabs from `config/watcher.yaml`, reads only visible browser text, and writes fresh Steve messages into the normal raw pipeline.
+
+Before the first live run, mark current visible history as seen so old alerts are not traded:
+
+```sh
+python3 scripts/discord_browser_channel_watcher.py --mark-existing --max-age-minutes 0
+```
+
+Run one safe live pass:
+
+```sh
+python3 scripts/discord_browser_channel_watcher.py --once --mode live --max-age-minutes 5
+```
+
+Run continuously during market hours from a foreground Terminal session:
+
+```sh
+scripts/run_browser_watcher_foreground.sh
+```
+
+This foreground runner uses `caffeinate` and is preferred over LaunchAgent for browser capture because Chrome Apple Events can time out from a background LaunchAgent while succeeding from an interactive Terminal session. It polls every 5 seconds by default; override with `BROWSER_WATCHER_INTERVAL_SECONDS=3 scripts/run_browser_watcher_foreground.sh` only if the nightly capture scorecard shows browser latency is still too high.
+
+The browser watcher writes:
+
+```sh
+data/discord_browser_messages.jsonl
+data/discord_browser_health.jsonl
+data/discord_browser_health_latest.json
+```
+
+If it sees a fresh Steve message, it writes a raw record to `data/raw_notifications.jsonl`; the existing parser/router then handles auto paper buys, hedge approvals, and Steve exits.
+
+The nightly review reports a capture-method scorecard comparing browser capture and macOS notifications by coverage, latency, and duplicate rate:
+
+```sh
+python3 scripts/nightly_review.py --refresh-browser --print-json
+```
+
+Use that scorecard to decide whether browser should stay primary, whether polling needs to be faster, or whether macOS notifications are still adding useful coverage.
+
+The older active-tab smoke test is still available:
 
 ```sh
 python3 scripts/discord_chrome_visible_capture.py --once --mode audit
@@ -107,9 +147,77 @@ The `--mark-existing` step seeds `data/discord_chrome_visible_capture_state.json
 
 Run this reader in a foreground terminal session. macOS may allow Chrome Apple Events from Terminal while blocking the same script under LaunchAgent. This reader only sees messages currently present in the active Chrome Discord tab. It is a fallback for missed macOS notifications, not a replacement for an official Discord bot/webhook.
 
+## Pipeline Health Monitor
+
+The health monitor checks each stage independently so a missed Telegram alert has an exact failure point:
+
+```sh
+python3 scripts/pipeline_health_monitor.py --once --no-telegram
+```
+
+It records:
+
+```sh
+data/pipeline_health_checks.jsonl
+data/pipeline_health_latest.json
+data/pipeline_health_alerts.jsonl
+```
+
+Failure codes identify where the miss happened:
+
+- `notification_db_row_not_raw`: macOS stored a Discord notification, but the watcher did not capture it.
+- `browser_message_not_raw`: browser saw a Steve message, but no raw pipeline record exists.
+- `raw_not_processed`: raw exists, parser/router did not process it.
+- `hedge_missing_approval_card`: parsed hedge alert did not create Telegram approval.
+- `non_hedge_missing_auto_buy`: parsed non-hedge alert did not create auto paper-buy artifacts.
+- `option_exit_not_recorded`: parsed Steve exit did not create an exit record.
+- `*_send_failed`: Telegram delivery failed.
+
+Install the health monitor LaunchAgent:
+
+```sh
+scripts/install_monitoring_launch_agents.sh
+```
+
+Check status:
+
+```sh
+launchctl print gui/$(id -u)/ai.openclaw.pipeline-health-monitor
+```
+
+The health monitor runs every 10 minutes during market hours. It sends Telegram only on new failures or recoveries unless run manually with `--no-telegram`. The browser watcher should be kept open in foreground Terminal; if it stops or fails, the health monitor reports `browser_health_stale` or `browser_capture_degraded`.
+
+## Nightly Recursive Review
+
+After each weekday market close, run the source-of-truth review:
+
+```sh
+python3 scripts/nightly_review.py --refresh-browser --send-telegram --print-json
+```
+
+The review reads Chrome Discord channel history directly without feeding old messages back into trading. It compares Steve's visible alerts against raw notifications, parsed alerts, Telegram reports, local paper positions/exits, Alpaca paper audits, broker status reports, and health checks.
+
+Reports are written to:
+
+```text
+data/nightly_reviews/YYYY-MM-DD.json
+data/nightly_reviews/YYYY-MM-DD.md
+data/nightly_review_reports.jsonl
+```
+
+The nightly LaunchAgent is installed with the monitoring agents and runs weekdays at 5:30 PM local time:
+
+```sh
+scripts/install_monitoring_launch_agents.sh
+launchctl print gui/$(id -u)/ai.openclaw.nightly-review
+```
+
+Use `SKILL.md` as the Codex operating guide when the nightly report recommends code/config/test changes. The allowed automation goal is to make the next paper-trading session better while preserving paper-only broker guards and rollback context.
+
 Uninstall:
 
 ```sh
+scripts/uninstall_monitoring_launch_agents.sh
 scripts/uninstall_launch_agent.sh
 ```
 

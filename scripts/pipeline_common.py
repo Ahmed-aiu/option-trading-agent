@@ -195,11 +195,19 @@ def atomic_touch_jsonl_files() -> None:
         DATA_DIR / "steve_approval_actions.jsonl",
         DATA_DIR / "steve_close_reports.jsonl",
         DATA_DIR / "steve_auto_buy_reports.jsonl",
+        DATA_DIR / "steve_broker_order_reports.jsonl",
+        DATA_DIR / "broker_order_status_reports.jsonl",
+        DATA_DIR / "daily_pl_reports.jsonl",
+        DATA_DIR / "nightly_review_reports.jsonl",
         DATA_DIR / "human_paper_positions.jsonl",
         DATA_DIR / "human_paper_exits.jsonl",
         DATA_DIR / "option_validation_errors.jsonl",
         DATA_DIR / "daily_option_summaries.jsonl",
         DATA_DIR / "live_pipeline_heartbeats.jsonl",
+        DATA_DIR / "discord_browser_messages.jsonl",
+        DATA_DIR / "discord_browser_health.jsonl",
+        DATA_DIR / "pipeline_health_checks.jsonl",
+        DATA_DIR / "pipeline_health_alerts.jsonl",
     ]:
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():

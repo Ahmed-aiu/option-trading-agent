@@ -407,6 +407,10 @@ def option_order_client_id(source_key: str, contract_symbol: str) -> str:
     return f"openclaw-opt-{stable_hash([source_key, contract_symbol])[:24]}"[:48]
 
 
+def option_exit_order_client_id(position: dict[str, Any], contracts: int, trigger_key: str) -> str:
+    return f"openclaw-opt-exit-{stable_hash([position.get('position_id'), position.get('contract_symbol'), contracts, trigger_key])[:19]}"[:48]
+
+
 def build_option_order_payload(position: dict[str, Any]) -> dict[str, Any]:
     qty = int(position.get("contracts") or 0)
     if qty <= 0:
@@ -422,6 +426,20 @@ def build_option_order_payload(position: dict[str, Any]) -> dict[str, Any]:
         "qty": str(qty),
         "limit_price": str(limit_price),
         "client_order_id": option_order_client_id(str(position.get("source_dedupe_key") or position.get("position_id")), position["contract_symbol"]),
+    }
+
+
+def build_option_sell_order_payload(position: dict[str, Any], contracts: int, trigger_key: str) -> dict[str, Any]:
+    qty = int(contracts or 0)
+    if qty <= 0:
+        raise AdapterError("Option sell order qty must be a positive whole number")
+    return {
+        "symbol": position["contract_symbol"],
+        "side": "sell",
+        "type": "market",
+        "time_in_force": "day",
+        "qty": str(qty),
+        "client_order_id": option_exit_order_client_id(position, qty, trigger_key),
     }
 
 
@@ -444,18 +462,41 @@ def submit_option_paper_order(position: dict[str, Any]) -> dict[str, Any]:
     return audit
 
 
+def submit_option_paper_sell_order(position: dict[str, Any], contracts: int, reason: str, trigger_key: str) -> dict[str, Any]:
+    payload: dict[str, Any] | None = None
+    try:
+        config, env_file = load_adapter_config()
+        env = require_paper_environment(config, env_file, require_keys=True)
+        payload = build_option_sell_order_payload(position, contracts, trigger_key)
+        if not env.get("submit_enabled"):
+            raise AdapterError("paper_order_submission_disabled")
+        status, response, headers = alpaca_request("POST", "/v2/orders", env, payload)
+        response["_http_status"] = status
+        if headers.get("x-request-id"):
+            response["_x_request_id"] = headers["x-request-id"]
+        audit = option_order_audit(position, payload, response, "submitted", action="paper_exit_order", exit_reason=reason)
+    except Exception as exc:  # noqa: BLE001
+        audit = option_order_audit(position, payload, None, "blocked", str(exc), action="paper_exit_order", exit_reason=reason)
+    append_jsonl(DATA_DIR / "orders_paper.jsonl", audit)
+    return audit
+
+
 def option_order_audit(
     position: dict[str, Any],
     payload: dict[str, Any] | None,
     response: dict[str, Any] | None,
     status: str,
     reason: str = "",
+    action: str = "paper_entry_order",
+    exit_reason: str = "",
 ) -> dict[str, Any]:
     return {
         "event_type": "alpaca_option_paper_order_audit",
+        "action": action,
         "recorded_at": now_iso(),
         "status": status,
         "reason": reason,
+        "exit_reason": exit_reason,
         "position_id": position.get("position_id"),
         "source_dedupe_key": position.get("source_dedupe_key"),
         "ticker": position.get("ticker"),

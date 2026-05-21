@@ -1,62 +1,67 @@
 # GitHub Publishing
 
-This folder is not currently a Git repository. Before publishing, decide whether the repo should be private or public.
+This repository is published as `Ahmed-aiu/option-trading-agent`.
 
-## Do Not Publish
+## Public Repo Safety
 
-These files are intentionally ignored and should stay local:
+The repository is safe to publish only if local runtime and secret files stay ignored:
 
 - `.env.local`
+- `.env`
 - `config/watcher.yaml`
-- `data/*.jsonl`
-- `logs/*`
-- `.DS_Store`
+- `data/*` except `data/.gitkeep`
+- `logs/*` except `logs/.gitkeep`
+- `launchd/*.local.plist`
 - `__pycache__/`
 
-`config/watcher.yaml` can expose private Discord channel IDs or testing usernames. Use `config/watcher.example.yaml` in the repository and keep the local file ignored.
+Do not commit screenshots, Discord credentials, Discord private channel content, Telegram bot tokens, Alpaca keys, or runtime ledgers with real trading/account data.
 
-## Preflight
+## Preflight Before Push
+
+Run:
 
 ```sh
+git status -sb
+git status --ignored -sb
 python3 scripts/test_pipeline.py
 python3 scripts/test_full_pipeline.py
 python3 scripts/test_steve_options_mvp.py
 python3 -m py_compile scripts/*.py
-git status --ignored -sb
+git diff --check
 ```
 
-Confirm ignored files include `.env.local`, `data/`, `logs/`, and `config/watcher.yaml`.
+Confirm ignored files include `.env.local`, `config/watcher.yaml`, `data/`, and `logs/`.
 
-## New Repo Flow
+## Commit Scope
 
-```sh
-git init
-git add .
-git status -sb
-git commit -m "initial steve options validation bot"
-```
+Safe commit scope:
 
-With GitHub CLI:
+- Source code under `scripts/`.
+- Sanitized config templates under `config/`.
+- LaunchAgent templates under `launchd/`.
+- Human docs under `README.md` and `docs/`.
+- LLM/Codex operating docs under `AGENTS.md` and `SKILL.md`.
+- Tests and static samples that do not contain private account data.
 
-```sh
-gh auth status
-gh repo create <owner>/<repo-name> --private --source=. --remote=origin --push
-```
+Unsafe commit scope:
 
-Use `--public` only after reviewing whether any project names, screenshots, Discord server/channel IDs, or trading data should remain private.
+- Local runtime ledgers.
+- Local macOS or Telegram IDs unless intentionally documented as examples.
+- Secrets or credentials.
+- Any copied private Discord history.
 
-## Suggested Repo Description
+## Recommended Repo Description
 
 ```text
-Local paper-only Discord options alert validator with Telegram human approval, Alpaca data enrichment, and append-only audit ledgers.
+Local paper-only Discord options alert validator with Telegram approval, Alpaca data enrichment, browser capture, health monitoring, and nightly source-of-truth reviews.
 ```
 
 ## Suggested Topics
 
 ```text
-trading, options, paper-trading, telegram-bot, alpaca, discord-notifications, validation, jsonl
+trading, options, paper-trading, telegram-bot, alpaca, discord-notifications, validation, jsonl, macos, codex
 ```
 
 ## License
 
-Do not add a license automatically. Pick one intentionally before publishing publicly. Private repos can defer this.
+No license is included yet. Keep it that way until a license is chosen intentionally.

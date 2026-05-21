@@ -2,6 +2,7 @@ app_names:
   - Discord
 bundle_ids:
   - com.hnc.Discord
+discord_guild_id: 483483452180791296
 alert_author_names:
   - OTWSteve
   - SteveOTWS
@@ -31,3 +32,4 @@ dedupe_window_minutes: 60
 write_all_discord_notifications: false
 timezone: America/Detroit
 capture_method: auto
+browser_watcher_interval_seconds: 5

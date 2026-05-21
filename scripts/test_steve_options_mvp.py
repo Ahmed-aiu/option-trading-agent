@@ -3,15 +3,21 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import tempfile
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import alpaca_options
 import backfill_steve_text
+import broker_order_monitor
+import discord_browser_channel_watcher
 import discord_chrome_visible_capture
 import notification_watcher
+import nightly_review
 import option_validation
+import pipeline_health_monitor
 import run_live_pipeline
 import run_pipeline_once
 import steve_trade_bot
@@ -60,12 +66,39 @@ def patch_runtime_paths(tmp_path: Path) -> None:
     option_validation.HUMAN_POSITIONS_FILE = tmp_path / "human_paper_positions.jsonl"
     option_validation.HUMAN_EXITS_FILE = tmp_path / "human_paper_exits.jsonl"
     option_validation.DAILY_SUMMARIES_FILE = tmp_path / "daily_option_summaries.jsonl"
+    option_validation.DAILY_PL_REPORTS_FILE = tmp_path / "daily_pl_reports.jsonl"
+    option_validation.submit_option_paper_sell_order = lambda position, contracts, reason, trigger_key: {
+        "status": "submitted",
+        "reason": "",
+        "payload": {"client_order_id": f"test-exit-{trigger_key}", "side": "sell", "qty": str(contracts)},
+        "response": {"id": f"order-{trigger_key}", "client_order_id": f"test-exit-{trigger_key}"},
+    }
     steve_trade_bot.APPROVAL_CARDS_FILE = tmp_path / "steve_approval_cards.jsonl"
     steve_trade_bot.APPROVAL_ACTIONS_FILE = tmp_path / "steve_approval_actions.jsonl"
     steve_trade_bot.CLOSE_REPORTS_FILE = tmp_path / "steve_close_reports.jsonl"
     steve_trade_bot.AUTO_BUY_REPORTS_FILE = tmp_path / "steve_auto_buy_reports.jsonl"
+    steve_trade_bot.BROKER_ORDER_REPORTS_FILE = tmp_path / "steve_broker_order_reports.jsonl"
+    steve_trade_bot.DAILY_PL_REPORTS_FILE = tmp_path / "daily_pl_reports.jsonl"
     steve_trade_bot.HUMAN_POSITIONS_FILE = tmp_path / "human_paper_positions.jsonl"
     steve_trade_bot.BOT_STATE_FILE = tmp_path / "steve_trade_bot_state.json"
+    broker_order_monitor.ORDERS_FILE = tmp_path / "orders_paper.jsonl"
+    broker_order_monitor.HUMAN_POSITIONS_FILE = tmp_path / "human_paper_positions.jsonl"
+    broker_order_monitor.ORDER_STATUS_FILE = tmp_path / "broker_order_status_reports.jsonl"
+    nightly_review.NIGHTLY_DIR = tmp_path / "nightly_reviews"
+    nightly_review.NIGHTLY_SUMMARY_FILE = tmp_path / "nightly_review_reports.jsonl"
+    nightly_review.BROWSER_MESSAGES_FILE = tmp_path / "discord_browser_messages.jsonl"
+    nightly_review.RAW_FILE = tmp_path / "raw_notifications.jsonl"
+    nightly_review.PARSED_FILE = tmp_path / "parsed_alerts.jsonl"
+    nightly_review.REJECTED_FILE = tmp_path / "rejected_alerts.jsonl"
+    nightly_review.APPROVAL_CARDS_FILE = tmp_path / "steve_approval_cards.jsonl"
+    nightly_review.AUTO_BUY_REPORTS_FILE = tmp_path / "steve_auto_buy_reports.jsonl"
+    nightly_review.HUMAN_POSITIONS_FILE = tmp_path / "human_paper_positions.jsonl"
+    nightly_review.HUMAN_EXITS_FILE = tmp_path / "human_paper_exits.jsonl"
+    nightly_review.ORDERS_FILE = tmp_path / "orders_paper.jsonl"
+    nightly_review.BROKER_STATUS_FILE = tmp_path / "broker_order_status_reports.jsonl"
+    nightly_review.STEVE_EXITS_FILE = tmp_path / "steve_option_exits.jsonl"
+    nightly_review.PIPELINE_HEALTH_FILE = tmp_path / "pipeline_health_checks.jsonl"
+    nightly_review.DAILY_PL_FILE = tmp_path / "daily_pl_reports.jsonl"
 
 
 def test_parser() -> None:
@@ -702,19 +735,141 @@ def test_chrome_visible_capture_filters_history_by_default() -> None:
 
 
 def test_option_order_payload() -> None:
-    payload = alpaca_options.build_option_order_payload(
-        {
-            "position_id": "human-test",
-            "source_dedupe_key": "source-test",
-            "contract_symbol": "QQQ260515P00710000",
-            "contracts": 2,
-            "entry_price": 5.86,
-        }
-    )
+    position = {
+        "position_id": "human-test",
+        "source_dedupe_key": "source-test",
+        "contract_symbol": "QQQ260515P00710000",
+        "contracts": 2,
+        "entry_price": 5.86,
+    }
+    payload = alpaca_options.build_option_order_payload(position)
     assert payload["symbol"] == "QQQ260515P00710000"
     assert payload["qty"] == "2"
     assert payload["type"] == "limit"
     assert "notional" not in payload
+    sell_payload = alpaca_options.build_option_sell_order_payload(position, 1, "stop_loss")
+    assert sell_payload["symbol"] == "QQQ260515P00710000"
+    assert sell_payload["qty"] == "1"
+    assert sell_payload["side"] == "sell"
+    assert sell_payload["type"] == "market"
+
+
+def test_broker_order_monitor_reports_terminal_fills() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        sent_messages: list[tuple[str, str]] = []
+        steve_trade_bot.load_bot_config = lambda required=False: steve_trade_bot.BotConfig(
+            token="test",
+            approval_chat_id="123456789",
+            owner_chat_id="123456789",
+            owner_user_id="123456789",
+            approval_chat_ids=("123456789",),
+        )
+        steve_trade_bot.send_telegram_message = lambda config, text, chat_id=None: (
+            sent_messages.append((str(chat_id or config.approval_chat_id), text))
+            or {"ok": True, "result": {"message_id": len(sent_messages), "chat": {"id": chat_id or config.approval_chat_id}}}
+        )
+        broker_order_monitor.load_order_environment = lambda: {"base_url": "paper", "key_id": "key", "secret_key": "secret"}
+        broker_order_monitor.fetch_order_status = lambda env, order_id: {
+            "id": order_id,
+            "client_order_id": "openclaw-opt-test",
+            "symbol": "CVX260522C00200000",
+            "side": "buy",
+            "qty": "3",
+            "filled_qty": "3",
+            "filled_avg_price": "0.52",
+            "status": "filled",
+            "submitted_at": "2026-05-20T14:51:37Z",
+            "filled_at": "2026-05-20T14:54:05Z",
+        }
+        append_jsonl(
+            broker_order_monitor.HUMAN_POSITIONS_FILE,
+            {
+                "position_id": "human-test",
+                "ticker": "CVX",
+                "expiration_date": "2026-05-22",
+                "option_type": "call",
+                "strike_price": 200,
+                "contract_symbol": "CVX260522C00200000",
+            },
+        )
+        append_jsonl(
+            broker_order_monitor.ORDERS_FILE,
+            {
+                "event_type": "alpaca_option_paper_order_audit",
+                "recorded_at": dt.datetime.now(ZoneInfo("America/Detroit")).isoformat(timespec="seconds"),
+                "status": "submitted",
+                "position_id": "human-test",
+                "contract_symbol": "CVX260522C00200000",
+                "payload": {"client_order_id": "openclaw-opt-test", "symbol": "CVX260522C00200000", "side": "buy", "qty": "3"},
+                "response": {"id": "order-test"},
+            },
+        )
+        counts = broker_order_monitor.check_broker_order_statuses_once(max_age_hours=24)
+        assert counts["reported"] == 1
+        reports = read_jsonl(broker_order_monitor.ORDER_STATUS_FILE)
+        assert reports[0]["broker_status"] == "filled"
+        assert "BROKER FILLED" in sent_messages[0][1]
+        assert "Bought 3 @ 0.52" in sent_messages[0][1]
+
+
+def test_daily_pl_summary_short_report() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        sent_messages: list[tuple[str, str]] = []
+        steve_trade_bot.load_bot_config = lambda required=False: steve_trade_bot.BotConfig(
+            token="test",
+            approval_chat_id="123456789",
+            owner_chat_id="123456789",
+            owner_user_id="123456789",
+            approval_chat_ids=("123456789",),
+        )
+        steve_trade_bot.send_telegram_message = lambda config, text, chat_id=None: (
+            sent_messages.append((str(chat_id or config.approval_chat_id), text))
+            or {"ok": True, "result": {"message_id": len(sent_messages), "chat": {"id": chat_id or config.approval_chat_id}}}
+        )
+        today = dt.datetime.now(ZoneInfo("America/Detroit")).date().isoformat()
+        append_jsonl(
+            option_validation.HUMAN_POSITIONS_FILE,
+            {
+                "position_id": "human-pl",
+                "approval_id": "auto-pl",
+                "source_dedupe_key": "pl-key",
+                "ticker": "CVX",
+                "contract_symbol": "CVX260522C00200000",
+                "contracts": 2,
+                "entry_price": 1.0,
+                "opened_at": f"{today}T10:00:00-04:00",
+            },
+        )
+        append_jsonl(
+            option_validation.QUOTE_SNAPSHOTS_FILE,
+            {
+                "position_id": "shadow-pl",
+                "source_dedupe_key": "pl-key",
+                "contract_symbol": "CVX260522C00200000",
+                "recorded_at": f"{today}T15:55:00-04:00",
+                "option_quote": {"mark": 1.5},
+            },
+        )
+        append_jsonl(
+            option_validation.HUMAN_EXITS_FILE,
+            {
+                "position_id": "human-other",
+                "recorded_at": f"{today}T11:00:00-04:00",
+                "contracts": 1,
+                "pnl_dollars": -25.0,
+            },
+        )
+        summary = option_validation.compute_daily_pl_summary(today)
+        assert summary["realized_pnl"] == -25.0
+        assert summary["open_pnl"] == 100.0
+        report = steve_trade_bot.send_daily_pl_report(summary)
+        assert report["status"] == "sent"
+        assert "DAILY PAPER P/L" in sent_messages[0][1]
+        assert "Total: +$75" in sent_messages[0][1]
 
 
 def test_watcher_steve_filters() -> None:
@@ -784,6 +939,329 @@ def test_live_pipeline_heartbeat() -> None:
             run_live_pipeline.HEARTBEAT_HISTORY_FILE = original_history
 
 
+def test_browser_channel_watcher_filters_and_backfills() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        original_data_dir = discord_browser_channel_watcher.DATA_DIR
+        original_messages = discord_browser_channel_watcher.BROWSER_MESSAGES_FILE
+        original_state = discord_browser_channel_watcher.BROWSER_STATE_FILE
+        try:
+            discord_browser_channel_watcher.DATA_DIR = tmp_path
+            discord_browser_channel_watcher.BROWSER_MESSAGES_FILE = tmp_path / "discord_browser_messages.jsonl"
+            discord_browser_channel_watcher.BROWSER_STATE_FILE = tmp_path / "discord_browser_state.json"
+            message = {
+                "id": "chat-messages-1-2",
+                "text": "OTWSteve\n#CVX May 22 200 call @ 1.59 Bought 3 #Lotto\nTuesday, May 19, 2026 at 3:19 PM",
+            }
+            timestamp = discord_browser_channel_watcher.extract_message_timestamp(message["text"])
+            assert timestamp is not None
+            candidates = discord_browser_channel_watcher.filter_candidate_messages(
+                [message],
+                ["OTWSteve", "SteveOTWS"],
+                max_age_minutes=0,
+                tz_name="America/Detroit",
+                allow_unknown_time=False,
+            )
+            assert len(candidates) == 1
+            counts = discord_browser_channel_watcher.process_browser_messages(
+                "492098253337264138",
+                "https://discord.com/channels/483483452180791296/492098253337264138",
+                candidates,
+                mode="live",
+                source_prefix="browser_channel",
+                process_raw=False,
+            )
+            assert counts["messages_new"] == 1
+            assert counts["raw_backfilled"] == 1
+            raw = read_jsonl(tmp_path / "raw_notifications.jsonl")
+            assert raw[0]["source_app"] == "DiscordUI"
+            assert raw[0]["dedupe_key"].startswith("ui-")
+            messages = read_jsonl(discord_browser_channel_watcher.BROWSER_MESSAGES_FILE)
+            assert messages[0]["capture_mode"] == "live"
+            assert messages[0]["raw_record_keys"] == [raw[0]["dedupe_key"]]
+        finally:
+            discord_browser_channel_watcher.DATA_DIR = original_data_dir
+            discord_browser_channel_watcher.BROWSER_MESSAGES_FILE = original_messages
+            discord_browser_channel_watcher.BROWSER_STATE_FILE = original_state
+
+
+def test_pipeline_health_pinpoints_stage_failures() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        originals = {
+            "RAW_FILE": pipeline_health_monitor.RAW_FILE,
+            "PROCESSED_FILE": pipeline_health_monitor.PROCESSED_FILE,
+            "PARSED_FILE": pipeline_health_monitor.PARSED_FILE,
+            "APPROVAL_CARDS_FILE": pipeline_health_monitor.APPROVAL_CARDS_FILE,
+            "AUTO_BUY_REPORTS_FILE": pipeline_health_monitor.AUTO_BUY_REPORTS_FILE,
+            "HUMAN_POSITIONS_FILE": pipeline_health_monitor.HUMAN_POSITIONS_FILE,
+            "STEVE_EXITS_FILE": pipeline_health_monitor.STEVE_EXITS_FILE,
+        }
+        try:
+            old_time = (dt.datetime.now(ZoneInfo("America/Detroit")) - dt.timedelta(minutes=5)).isoformat(timespec="seconds")
+            pipeline_health_monitor.RAW_FILE = tmp_path / "raw_notifications.jsonl"
+            pipeline_health_monitor.PROCESSED_FILE = tmp_path / "processed_notifications.jsonl"
+            pipeline_health_monitor.PARSED_FILE = tmp_path / "parsed_alerts.jsonl"
+            pipeline_health_monitor.APPROVAL_CARDS_FILE = tmp_path / "steve_approval_cards.jsonl"
+            pipeline_health_monitor.AUTO_BUY_REPORTS_FILE = tmp_path / "steve_auto_buy_reports.jsonl"
+            pipeline_health_monitor.HUMAN_POSITIONS_FILE = tmp_path / "human_paper_positions.jsonl"
+            pipeline_health_monitor.STEVE_EXITS_FILE = tmp_path / "steve_option_exits.jsonl"
+            append_jsonl(
+                pipeline_health_monitor.RAW_FILE,
+                {
+                    "dedupe_key": "raw-missed",
+                    "captured_at": old_time,
+                    "body": "#CVX May 22 200 call @ 1.59 Bought 3 #Lotto",
+                },
+            )
+            raw_issues = pipeline_health_monitor.check_raw_processing(90, "America/Detroit")
+            assert any(issue.code == "raw_not_processed" for issue in raw_issues)
+
+            append_jsonl(
+                pipeline_health_monitor.PARSED_FILE,
+                {
+                    "source_dedupe_key": "raw-missed",
+                    "parsed_at": old_time,
+                    "instrument_type": "option",
+                    "side": "buy",
+                    "ticker": "CVX",
+                    "tags": ["lotto"],
+                    "raw_text": "#CVX May 22 200 call @ 1.59 Bought 3 #Lotto",
+                },
+            )
+            routing_issues = pipeline_health_monitor.check_routing(90, "America/Detroit")
+            assert any(issue.code == "non_hedge_missing_auto_buy" for issue in routing_issues)
+        finally:
+            for name, value in originals.items():
+                setattr(pipeline_health_monitor, name, value)
+
+
+def test_nightly_review_detects_recursive_improvement_issues() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        day = "2026-05-20"
+        assert nightly_review.contract_key({"contract_symbol": "FRVO260717C00045000"}) == "FRVO|2026-07-17|45|call"
+        append_jsonl(
+            nightly_review.BROWSER_MESSAGES_FILE,
+            {
+                "event_type": "discord_browser_message",
+                "captured_at": f"{day}T15:59:38-04:00",
+                "message_timestamp": f"{day}T15:59:00-04:00",
+                "channel_id": "1124441863848476863",
+                "message_key": "msg-frvo",
+                "text_preview": "OTWSteve\n#FRVO July 17 45 call @ 4.95 Bought 4 #swing",
+            },
+        )
+        append_jsonl(
+            nightly_review.BROWSER_MESSAGES_FILE,
+            {
+                "event_type": "discord_browser_message",
+                "captured_at": f"{day}T10:55:16-04:00",
+                "message_timestamp": f"{day}T10:55:00-04:00",
+                "channel_id": "562178552984764436",
+                "message_key": "msg-msft-add",
+                "text_preview": "OTWSteve\n#MSFT Jun 18 450 call @ 6.35 bought 4 #swing\nadded 2 @ 3.70 #swing",
+            },
+        )
+        append_jsonl(
+            nightly_review.BROWSER_MESSAGES_FILE,
+            {
+                "event_type": "discord_browser_message",
+                "captured_at": f"{day}T11:16:56-04:00",
+                "message_timestamp": f"{day}T11:16:00-04:00",
+                "channel_id": "492098253337264138",
+                "message_key": "msg-xom-stop",
+                "text_preview": "OTWSteve\n#XOM May 22 162.50 call @ 1.14 Bought 4 #lotto\nstopped out",
+            },
+        )
+        append_jsonl(
+            nightly_review.PARSED_FILE,
+            {
+                "source_dedupe_key": "frvo-parsed",
+                "parsed_at": f"{day}T15:59:38-04:00",
+                "instrument_type": "option",
+                "side": "buy",
+                "ticker": "FRVO",
+                "expiration_date": "2026-07-17",
+                "strike_price": 45.0,
+                "option_type": "call",
+                "entry_price": 4.95,
+                "contracts": 4,
+                "tags": ["swing"],
+            },
+        )
+        for position_id in ("human-frvo-1", "human-frvo-2"):
+            append_jsonl(
+                nightly_review.HUMAN_POSITIONS_FILE,
+                {
+                    "event_type": "human_paper_option_position",
+                    "opened_at": f"{day}T15:59:39-04:00",
+                    "position_id": position_id,
+                    "ticker": "FRVO",
+                    "expiration_date": "2026-07-17",
+                    "strike_price": 45.0,
+                    "option_type": "call",
+                    "entry_price": 5.36,
+                    "contracts": 4,
+                },
+            )
+        append_jsonl(
+            nightly_review.ORDERS_FILE,
+            {
+                "event_type": "alpaca_option_paper_order_audit",
+                "recorded_at": f"{day}T13:21:15-04:00",
+                "status": "blocked",
+                "ticker": "CVX",
+                "contract_symbol": "CVX260522C00200000",
+                "reason": 'Alpaca HTTP 403: {"message":"account not eligible to trade uncovered option contracts"}',
+                "payload": {"side": "sell", "qty": "3"},
+            },
+        )
+
+        report = nightly_review.review_day(day, refresh_browser=False)
+        codes = {item["code"] for item in report["issues"]}
+        assert "duplicate_paper_position" in codes
+        assert "entry_price_worse_than_alert" in codes
+        assert "scale_in_not_supported" in codes
+        assert "contextual_stop_not_executed" in codes
+        assert "broker_position_reconciliation_failed" in codes
+        assert report["counts"]["truth_buys"] == 3
+
+
+def test_nightly_review_capture_method_scorecard() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        day = "2026-05-20"
+        append_jsonl(
+            nightly_review.BROWSER_MESSAGES_FILE,
+            {
+                "event_type": "discord_browser_message",
+                "captured_at": f"{day}T10:30:08-04:00",
+                "message_timestamp": f"{day}T10:30:00-04:00",
+                "channel_id": "492098253337264138",
+                "message_key": "msg-two-alerts",
+                "text_preview": "\n".join(
+                    [
+                        "OTWSteve",
+                        "#TSLA May 22 390 put @ 4.90 Bought 2 #hedge",
+                        "#SPY May 22 730 put @ 3.71 Bought 4 #hedge",
+                    ]
+                ),
+            },
+        )
+        for body, second in (
+            ("#TSLA May 22 390 put @ 4.90 Bought 2 #hedge", "08"),
+            ("#SPY May 22 730 put @ 3.71 Bought 4 #hedge", "09"),
+        ):
+            append_jsonl(
+                nightly_review.RAW_FILE,
+                {
+                    "event_type": "raw_discord_ui_backfill",
+                    "captured_at": f"{day}T10:30:{second}-04:00",
+                    "source_app": "DiscordUI",
+                    "bundle_id": "browser_or_clipboard",
+                    "title": "OTWSteve",
+                    "subtitle": "browser_channel:492098253337264138",
+                    "body": body,
+                    "raw": {"source": "browser_channel:492098253337264138"},
+                    "dedupe_key": f"ui-{second}",
+                },
+            )
+        for index, second in enumerate(("45", "50"), start=1):
+            append_jsonl(
+                nightly_review.RAW_FILE,
+                {
+                    "event_type": "raw_discord_notification",
+                    "captured_at": f"{day}T10:30:{second}-04:00",
+                    "notification_timestamp": f"{day}T10:30:{second}-04:00",
+                    "source_app": "Discord",
+                    "bundle_id": "com.hnc.Discord",
+                    "title": "OTWSteve",
+                    "subtitle": "short-term-call-outs-same-week-or-1-week",
+                    "body": "#TSLA May 22 390 put @ 4.90 Bought 2 #hedge",
+                    "raw": {"thread": "492098253337264138"},
+                    "dedupe_key": f"notif-tsla-{index}",
+                },
+            )
+
+        report = nightly_review.review_day(day, refresh_browser=False)
+        scorecard = report["capture_method_scorecard"]
+        browser = scorecard["methods"]["browser"]
+        notification = scorecard["methods"]["notification"]
+        assert scorecard["truth_event_count"] == 2
+        assert browser["matched_truth_events"] == 2
+        assert browser["capture_rate"] == 1.0
+        assert browser["latency"]["avg_seconds"] == 8.5
+        assert notification["matched_truth_events"] == 1
+        assert notification["capture_rate"] == 0.5
+        assert notification["duplicate_event_records"] == 1
+        assert scorecard["cross_source_duplicate_truth_events"] == 1
+        assert scorecard["recommendation"]["recommended_primary"] == "browser"
+
+
+def test_nightly_review_writes_markdown_and_summary() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        report = {
+            "event_type": "nightly_pipeline_review",
+            "day": "2026-05-20",
+            "generated_at": "2026-05-20T17:30:00-04:00",
+            "truth_events": [],
+            "counts": {"truth_buys": 0, "truth_exits": 0, "truth_adds": 0, "truth_context_stops": 0, "matched_buys": 0, "paper_entries": 0, "broker_filled_buys": 0},
+            "issue_counts": {"critical": 1},
+            "capture_method_scorecard": {
+                "truth_event_count": 1,
+                "methods": {
+                    "browser": {
+                        "matched_truth_events": 1,
+                        "capture_rate": 1.0,
+                        "latency": {"avg_seconds": 4.0},
+                        "raw_records": 1,
+                        "duplicate_event_records": 0,
+                    },
+                    "notification": {
+                        "matched_truth_events": 0,
+                        "capture_rate": 0.0,
+                        "latency": {"avg_seconds": None},
+                        "raw_records": 0,
+                        "duplicate_event_records": 0,
+                    },
+                    "other": {
+                        "matched_truth_events": 0,
+                        "capture_rate": 0.0,
+                        "latency": {"avg_seconds": None},
+                        "raw_records": 0,
+                        "duplicate_event_records": 0,
+                    },
+                },
+                "cross_source_duplicate_truth_events": 0,
+                "recommendation": {"recommended_primary": "browser", "reason": "test", "browser_interval_seconds": 5},
+            },
+            "issues": [
+                {
+                    "severity": "critical",
+                    "code": "duplicate_paper_position",
+                    "message": "Duplicate paper position.",
+                    "recommendation": "Canonicalize dedupe across sources.",
+                }
+            ],
+            "daily_pl": {"total_pnl": -25.0},
+            "recommended_next_actions": ["Canonicalize dedupe across sources."],
+        }
+        json_path, md_path = nightly_review.write_report(report)
+        assert json_path.exists()
+        assert md_path.exists()
+        assert "duplicate_paper_position" in md_path.read_text(encoding="utf-8")
+        summary_rows = read_jsonl(nightly_review.NIGHTLY_SUMMARY_FILE)
+        assert len(summary_rows) == 1
+        message = nightly_review.telegram_summary(report)
+        assert "NIGHTLY PIPELINE REVIEW" in message
+        assert "Issues: 1 critical" in message
+
+
 def main() -> int:
     test_parser()
     test_validation_and_approval()
@@ -797,8 +1275,15 @@ def main() -> int:
     test_backfill_text_audit_matches_contextual_exits()
     test_chrome_visible_capture_filters_history_by_default()
     test_option_order_payload()
+    test_broker_order_monitor_reports_terminal_fills()
+    test_daily_pl_summary_short_report()
     test_watcher_steve_filters()
     test_live_pipeline_heartbeat()
+    test_browser_channel_watcher_filters_and_backfills()
+    test_pipeline_health_pinpoints_stage_failures()
+    test_nightly_review_detects_recursive_improvement_issues()
+    test_nightly_review_capture_method_scorecard()
+    test_nightly_review_writes_markdown_and_summary()
     print("Steve options MVP tests passed")
     return 0
 

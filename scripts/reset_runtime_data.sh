@@ -20,10 +20,18 @@ for file in \
   steve_approval_actions.jsonl \
   steve_close_reports.jsonl \
   steve_auto_buy_reports.jsonl \
+  steve_broker_order_reports.jsonl \
+  broker_order_status_reports.jsonl \
+  daily_pl_reports.jsonl \
+  nightly_review_reports.jsonl \
   human_paper_positions.jsonl \
   human_paper_exits.jsonl \
   option_validation_errors.jsonl \
-  daily_option_summaries.jsonl
+  daily_option_summaries.jsonl \
+  discord_browser_messages.jsonl \
+  discord_browser_health.jsonl \
+  pipeline_health_checks.jsonl \
+  pipeline_health_alerts.jsonl
 do
   if [ -f "$PROJECT_DIR/data/$file" ]; then
     mv "$PROJECT_DIR/data/$file" "$ARCHIVE_DIR/$file"

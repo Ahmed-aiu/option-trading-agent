@@ -9,7 +9,8 @@ import signal
 import time
 
 from notification_watcher import poll_once
-from option_validation import track_open_positions_once
+from broker_order_monitor import check_broker_order_statuses_once
+from option_validation import send_daily_pl_summary_once, track_open_positions_once
 from pipeline_common import CONFIG_DIR, DATA_DIR, LOG_DIR, append_jsonl, atomic_touch_jsonl_files, load_seen_keys, load_simple_yaml, now_iso, read_jsonl, setup_logging
 from run_pipeline_once import process_raw_notifications
 from steve_trade_bot import poll_once as poll_telegram_approvals
@@ -46,8 +47,12 @@ def main() -> int:
     seen_notifications = load_seen_keys(DATA_DIR / "raw_notifications.jsonl")
     interval = float(config.get("poll_interval_seconds", 1))
     option_track_interval = float(config.get("option_track_interval_seconds", 15))
+    broker_order_interval = float(config.get("broker_order_monitor_interval_seconds", 30))
+    daily_pl_interval = float(config.get("daily_pl_summary_check_interval_seconds", 300))
     heartbeat_interval = float(config.get("heartbeat_interval_seconds", 30))
     last_option_track = 0.0
+    last_broker_order_check = 0.0
+    last_daily_pl_check = 0.0
     last_heartbeat = 0.0
     logger.info("Live pipeline starting")
     while not STOP:
@@ -63,6 +68,8 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             logger.info("telegram_approval_poll_skipped=%s", exc)
         option_counts = {"open_positions": 0, "snapshots": 0}
+        broker_counts = {"checked": 0, "reported": 0}
+        daily_pl_counts = {"sent": False}
         now_monotonic = time.monotonic()
         if now_monotonic - last_option_track >= option_track_interval:
             try:
@@ -70,6 +77,20 @@ def main() -> int:
                 last_option_track = now_monotonic
             except Exception as exc:  # noqa: BLE001
                 logger.info("option_tracking_skipped=%s", exc)
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_broker_order_check >= broker_order_interval:
+            try:
+                broker_counts = check_broker_order_statuses_once()
+                last_broker_order_check = now_monotonic
+            except Exception as exc:  # noqa: BLE001
+                logger.info("broker_order_monitor_skipped=%s", exc)
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_daily_pl_check >= daily_pl_interval:
+            try:
+                daily_pl_counts = send_daily_pl_summary_once(str(config.get("timezone") or "America/Detroit"))
+                last_daily_pl_check = now_monotonic
+            except Exception as exc:  # noqa: BLE001
+                logger.info("daily_pl_summary_skipped=%s", exc)
         now_monotonic = time.monotonic()
         if now_monotonic - last_heartbeat >= heartbeat_interval:
             write_heartbeat(
@@ -81,24 +102,37 @@ def main() -> int:
                     "pipeline": counts,
                     "telegram": telegram_counts,
                     "option_tracking": option_counts,
+                    "broker_orders": broker_counts,
+                    "daily_pl": daily_pl_counts,
                     "loop_seconds": round(now_monotonic - loop_started, 3),
                 }
             )
             last_heartbeat = now_monotonic
-        if written or duplicates or counts["raw_new"] or telegram_counts.get("actions") or option_counts.get("snapshots"):
+        if (
+            written
+            or duplicates
+            or counts["raw_new"]
+            or telegram_counts.get("actions")
+            or option_counts.get("snapshots")
+            or broker_counts.get("reported")
+            or daily_pl_counts.get("sent")
+        ):
             logger.info(
-                "capture_written=%d duplicate_notifications=%d pipeline=%s telegram=%s option_tracking=%s",
+                "capture_written=%d duplicate_notifications=%d pipeline=%s telegram=%s option_tracking=%s broker_orders=%s daily_pl=%s",
                 written,
                 duplicates,
                 counts,
                 telegram_counts,
                 option_counts,
+                broker_counts,
+                daily_pl_counts,
             )
             print(
                 "capture_written={written} duplicates={duplicates} raw_new={raw_new} "
                 "parsed={parsed} rejected={rejected} allowed={allowed} blocked={blocked} dry_runs={dry_runs} "
                 "option_shadow={option_shadow} option_cards={option_cards} telegram_actions={telegram_actions} "
-                "option_auto_buys={option_auto_buys} option_snapshots={option_snapshots} human_exits={human_exits}".format(
+                "option_auto_buys={option_auto_buys} option_snapshots={option_snapshots} human_exits={human_exits} "
+                "broker_reports={broker_reports} daily_pl_sent={daily_pl_sent}".format(
                     written=written,
                     duplicates=duplicates,
                     raw_new=counts["raw_new"],
@@ -113,6 +147,8 @@ def main() -> int:
                     telegram_actions=telegram_counts.get("actions", 0),
                     option_snapshots=option_counts.get("snapshots", 0),
                     human_exits=option_counts.get("human_exits", 0),
+                    broker_reports=broker_counts.get("reported", 0),
+                    daily_pl_sent=daily_pl_counts.get("sent", False),
                 )
             )
         if args.once:

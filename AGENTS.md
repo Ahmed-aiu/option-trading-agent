@@ -13,8 +13,8 @@ This repository is a local, paper-only trading alert validation pipeline. Keep c
 ## Main Flow
 
 ```text
-macOS Discord notification
- -> scripts/notification_watcher.py
+macOS Discord notification and/or Chrome Discord browser watcher
+ -> scripts/notification_watcher.py / scripts/discord_browser_channel_watcher.py
  -> data/raw_notifications.jsonl
  -> scripts/run_pipeline_once.py
  -> scripts/parse_alert.py
@@ -26,6 +26,18 @@ macOS Discord notification
 
 The continuous process is `scripts/run_live_pipeline.py`. On macOS it is installed through `scripts/install_launch_agent.sh`.
 
+## Recursive Nightly Improvement
+
+Use `SKILL.md` as the operating guide for post-market review and auto-improvement. The nightly reviewer is:
+
+```sh
+python3 scripts/nightly_review.py --refresh-browser --send-telegram --print-json
+```
+
+It treats logged-in Chrome Discord channel history as source of truth, reconciles every Steve alert against local ledgers and Alpaca paper audits, writes reports under `data/nightly_reviews/`, and sends a short Telegram summary. Automatic code changes must remain paper-only, preserve rollback context, run tests, and keep tomorrow's local pipeline deployable.
+
+Nightly reports include a capture-method scorecard. Use it to decide whether browser capture, macOS notifications, or both should be primary. Do not change capture priority or browser polling rate without evidence in the scorecard or a direct user request.
+
 ## Key Files
 
 - `scripts/parse_alert.py`: deterministic parser for Steve-style option entries and exits.
@@ -33,6 +45,7 @@ The continuous process is `scripts/run_live_pipeline.py`. On macOS it is install
 - `scripts/steve_trade_bot.py`: Telegram approval cards, reply parsing, human paper entry ledger.
 - `scripts/alpaca_options.py`: Alpaca data enrichment and optional paper option order audit.
 - `scripts/alpaca_paper_adapter.py`: stock paper order adapter and paper endpoint guard.
+- `scripts/nightly_review.py`: post-market source-of-truth reconciliation and improvement report.
 - `config/parser_patterns.yaml`: parser feature flags and ambiguous phrase policy.
 - `config/risk.yaml`: conservative stock risk policy. Options are handled by manual approval.
 - `config/watcher.example.yaml`: sanitized watcher config template. Local `config/watcher.yaml` is ignored.
@@ -71,5 +84,6 @@ Append-only ledgers live under `data/` and are intentionally ignored by git. The
 - `human_paper_positions.jsonl`
 - `human_paper_exits.jsonl`
 - `daily_option_summaries.jsonl`
+- `nightly_review_reports.jsonl`
 
 Use `scripts/reset_runtime_data.sh` to archive and clear local ledgers before a clean test session.

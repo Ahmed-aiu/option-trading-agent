@@ -24,6 +24,8 @@ APPROVAL_CARDS_FILE = DATA_DIR / "steve_approval_cards.jsonl"
 APPROVAL_ACTIONS_FILE = DATA_DIR / "steve_approval_actions.jsonl"
 CLOSE_REPORTS_FILE = DATA_DIR / "steve_close_reports.jsonl"
 AUTO_BUY_REPORTS_FILE = DATA_DIR / "steve_auto_buy_reports.jsonl"
+BROKER_ORDER_REPORTS_FILE = DATA_DIR / "steve_broker_order_reports.jsonl"
+DAILY_PL_REPORTS_FILE = DATA_DIR / "daily_pl_reports.jsonl"
 HUMAN_POSITIONS_FILE = DATA_DIR / "human_paper_positions.jsonl"
 BOT_STATE_FILE = DATA_DIR / "steve_trade_bot_state.json"
 DEFAULT_STOP_PERCENT = 35.0
@@ -150,6 +152,36 @@ def send_telegram_message(config: BotConfig, text: str, chat_id: str | None = No
     return telegram_request(config.token, "sendMessage", {"chat_id": chat_id or config.approval_chat_id, "text": text})
 
 
+def send_message_to_configured_chats(message: str) -> tuple[str, str, list[dict[str, Any]]]:
+    config = load_bot_config(required=False)
+    if config is None:
+        return "telegram_disabled", "missing_steve_trade_bot_env", []
+    messages: list[dict[str, Any]] = []
+    for chat_id in configured_approval_chat_ids(config):
+        try:
+            response = send_telegram_message(config, message, chat_id=chat_id)
+            if not response.get("ok"):
+                raise RuntimeError(f"Telegram returned non-ok response: {response}")
+            result = response.get("result", {})
+            chat = result.get("chat") or {}
+            messages.append(
+                {
+                    "chat_id": str(chat.get("id") if chat.get("id") is not None else chat_id),
+                    "message_id": result.get("message_id"),
+                    "status": "sent",
+                    "reason": "",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            messages.append({"chat_id": str(chat_id), "message_id": None, "status": "send_failed", "reason": str(exc)})
+    successes = [row for row in messages if row.get("status") == "sent"]
+    failures = [row for row in messages if row.get("status") != "sent"]
+    reason = "; ".join(f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason"))
+    if successes:
+        return ("partial_sent" if failures else "sent"), reason, messages
+    return "send_failed", reason, messages
+
+
 def format_price(value: Any) -> str:
     try:
         return f"{float(value):.2f}"
@@ -174,6 +206,10 @@ def format_signed_money(value: Any) -> str:
     if absolute >= 100 or absolute.is_integer():
         return f"{sign}${absolute:,.0f}"
     return f"{sign}${absolute:,.2f}"
+
+
+def order_side_word(side: Any) -> str:
+    return "Sold" if str(side).lower() == "sell" else "Bought"
 
 
 def option_exit_label(exit_record: dict[str, Any]) -> str:
@@ -224,16 +260,20 @@ def close_report_message(exit_record: dict[str, Any]) -> str:
     status = "CLOSED FULL" if remaining <= 0 else "CLOSED PARTIAL"
     sold = int(exit_record.get("contracts") or 0)
     total = int(exit_record.get("position_contracts") or sold + remaining)
-    return "\n".join(
-        [
-            status,
-            option_exit_label(exit_record),
-            f"Sold {sold}/{total} @ {format_price(exit_record.get('exit_price'))} ({format_signed_pct(exit_record.get('pnl_percent'))})",
-            f"P/L: {format_signed_money(exit_record.get('pnl_dollars'))}",
-            f"Remain: {remaining}",
-            f"Reason: {close_reason_text(exit_record)}",
-        ]
-    )
+    lines = [
+        status,
+        option_exit_label(exit_record),
+        f"Sold {sold}/{total} @ {format_price(exit_record.get('exit_price'))} ({format_signed_pct(exit_record.get('pnl_percent'))})",
+        f"P/L: {format_signed_money(exit_record.get('pnl_dollars'))}",
+        f"Remain: {remaining}",
+        f"Reason: {close_reason_text(exit_record)}",
+    ]
+    if exit_record.get("broker_status"):
+        broker_line = f"Broker: {exit_record.get('broker_status')}"
+        if exit_record.get("broker_reason"):
+            broker_line += f" ({exit_record.get('broker_reason')})"
+        lines.append(broker_line)
+    return "\n".join(lines)
 
 
 def send_human_exit_report(exit_record: dict[str, Any]) -> dict[str, Any]:
@@ -283,6 +323,69 @@ def send_human_exit_report(exit_record: dict[str, Any]) -> dict[str, Any]:
                 f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
             )
     append_jsonl(CLOSE_REPORTS_FILE, report)
+    return report
+
+
+def broker_order_report_message(status_report: dict[str, Any]) -> str:
+    status = str(status_report.get("broker_status") or "unknown").upper()
+    label = status_report.get("label") or status_report.get("contract_symbol") or "OPTION"
+    side_word = order_side_word(status_report.get("side"))
+    qty = int(float(status_report.get("filled_qty") or status_report.get("qty") or 0))
+    price = status_report.get("filled_avg_price") or status_report.get("limit_price")
+    return "\n".join(
+        [
+            f"BROKER {status}",
+            str(label),
+            f"{side_word} {qty} @ {format_price(price)}",
+        ]
+    )
+
+
+def send_broker_order_report(status_report: dict[str, Any]) -> dict[str, Any]:
+    message = broker_order_report_message(status_report)
+    status, reason, messages = send_message_to_configured_chats(message)
+    report = {
+        "event_type": "steve_broker_order_report",
+        "order_id": status_report.get("order_id"),
+        "client_order_id": status_report.get("client_order_id"),
+        "broker_status": status_report.get("broker_status"),
+        "position_id": status_report.get("position_id"),
+        "created_at": now_iso(),
+        "status": status,
+        "reason": reason,
+        "message_text": message,
+        "telegram_messages": messages,
+    }
+    append_jsonl(BROKER_ORDER_REPORTS_FILE, report)
+    return report
+
+
+def daily_pl_report_message(summary: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "DAILY PAPER P/L",
+            f"Realized: {format_signed_money(summary.get('realized_pnl'))}",
+            f"Open: {format_signed_money(summary.get('open_pnl'))}",
+            f"Total: {format_signed_money(summary.get('total_pnl'))}",
+            f"Open positions: {int(summary.get('open_positions') or 0)} | Exits: {int(summary.get('exits_today') or 0)}",
+        ]
+    )
+
+
+def send_daily_pl_report(summary: dict[str, Any]) -> dict[str, Any]:
+    message = daily_pl_report_message(summary)
+    status, reason, messages = send_message_to_configured_chats(message)
+    report = {
+        "event_type": "daily_pl_report",
+        "day": summary.get("day"),
+        "created_at": now_iso(),
+        "status": status,
+        "reason": reason,
+        "message_text": message,
+        "summary": summary,
+        "telegram_messages": messages,
+    }
+    append_jsonl(DAILY_PL_REPORTS_FILE, report)
     return report
 
 
