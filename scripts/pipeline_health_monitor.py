@@ -340,7 +340,7 @@ def check_routing(sla_seconds: int, tz_name: str) -> list[Issue]:
                         evidence={"source_dedupe_key": key, "ticker": parsed.get("ticker"), "raw_text": str(parsed.get("raw_text") or "")[:180]},
                     )
                 )
-        elif key not in auto_reports and key not in human_positions:
+        elif key not in auto_reports and key not in human_positions and key not in cards:
             issues.append(
                 Issue(
                     stage="routing",

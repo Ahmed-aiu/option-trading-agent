@@ -31,6 +31,7 @@ BOT_STATE_FILE = DATA_DIR / "steve_trade_bot_state.json"
 DEFAULT_STOP_PERCENT = 35.0
 DEFAULT_TAKE_PERCENT = 80.0
 DEFAULT_RUNNER_TAKE_PERCENTS = (120.0, 200.0)
+DEFAULT_MAX_ENTRY_SLIPPAGE_PCT = 5.0
 
 COMMAND_RE = re.compile(r"^(?P<command>buy|skip)\b(?P<rest>.*)$", re.I | re.S)
 KV_RE = re.compile(r"(?P<key>[A-Za-z_]+)=(?P<value>[^\s]+)")
@@ -484,13 +485,41 @@ def quote_is_fresh(quote: dict[str, Any], max_age_seconds: int = 300) -> bool:
     return 0 <= (now_time - quote_time).total_seconds() <= max_age_seconds
 
 
+def max_entry_slippage_pct() -> float:
+    raw = os.environ.get("OPENCLAW_MAX_ENTRY_SLIPPAGE_PCT", "")
+    if not raw:
+        return DEFAULT_MAX_ENTRY_SLIPPAGE_PCT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ENTRY_SLIPPAGE_PCT
+    return value if value > 0 else DEFAULT_MAX_ENTRY_SLIPPAGE_PCT
+
+
+def cap_entry_price(alert: dict[str, Any], candidate_price: float) -> tuple[float, bool]:
+    try:
+        alert_price = float(alert.get("entry_price"))
+    except (TypeError, ValueError):
+        return candidate_price, False
+    if alert_price <= 0:
+        return candidate_price, False
+    cap_price = alert_price * (1 + (max_entry_slippage_pct() / 100))
+    if candidate_price > cap_price:
+        return round(cap_price, 2), True
+    return candidate_price, False
+
+
 def suggested_entry_price(alert: dict[str, Any], snapshot: dict[str, Any]) -> tuple[float, str]:
     quote = snapshot.get("option_quote") or {}
     if quote.get("status") == "ok" and quote_is_fresh(quote):
         for key, source in (("ask", "current_ask"), ("mark", "current_mark")):
             value = quote.get(key)
             if value is not None and float(value) > 0:
-                return float(value), source
+                candidate = float(value)
+                capped, was_capped = cap_entry_price(alert, candidate)
+                if was_capped:
+                    return capped, f"{source}_slippage_capped"
+                return candidate, source
     return float(alert.get("entry_price")), "steve_alert_price"
 
 
@@ -546,9 +575,11 @@ def exit_plan_for_contracts(
 
 
 def approval_message(alert: dict[str, Any], snapshot: dict[str, Any], approval_id: str) -> str:
-    return "\n".join(
+    lines = [f"Alert: {alert.get('matched_text') or alert.get('raw_text')}"]
+    if alert.get("approval_reason"):
+        lines.append(str(alert.get("approval_reason")))
+    lines.extend(
         [
-            f"Alert: {alert.get('matched_text') or alert.get('raw_text')}",
             "",
             "Reply:",
             "skip",
@@ -557,6 +588,7 @@ def approval_message(alert: dict[str, Any], snapshot: dict[str, Any], approval_i
             dynamic_price_command_example(alert, snapshot),
         ]
     )
+    return "\n".join(lines)
 
 
 def successful_card_message_refs(card: dict[str, Any]) -> list[dict[str, Any]]:
@@ -883,15 +915,7 @@ def card_for_message(message: dict[str, Any]) -> dict[str, Any] | None:
 def fill_price_from_card(card: dict[str, Any]) -> tuple[float, str]:
     snapshot = card.get("snapshot") or {}
     alert = card.get("alert") or {}
-    price, source = suggested_entry_price(alert, snapshot)
-    if source == "steve_alert_price":
-        return price, source
-    quote = snapshot.get("option_quote") or {}
-    for key, source in (("ask", "approval_ask"), ("mark", "approval_mark")):
-        value = quote.get(key)
-        if value is not None and float(value) > 0:
-            return float(value), source
-    return float(alert.get("entry_price")), "steve_alert_price"
+    return suggested_entry_price(alert, snapshot)
 
 
 def validate_command_for_card(card: dict[str, Any], command: dict[str, Any]) -> tuple[bool, str]:

@@ -373,14 +373,10 @@ def signal_score(alert: dict[str, Any], snapshot: dict[str, Any]) -> tuple[int, 
     return max(0, min(100, score)), warnings
 
 
-def enrich_option_alert(alert: dict[str, Any]) -> dict[str, Any]:
+def enrich_option_alert(alert: dict[str, Any], include_context: bool = True) -> dict[str, Any]:
     contract_symbol = option_symbol(alert["ticker"], alert["expiration_date"], alert["option_type"], alert["strike_price"])
     option_quote = latest_option_quote(contract_symbol)
     underlying_quote = latest_stock_quote(str(alert["ticker"]))
-    underlying_indicators = indicator_snapshot(str(alert["ticker"]))
-    spy_indicators = indicator_snapshot("SPY")
-    qqq_indicators = indicator_snapshot("QQQ")
-    news = latest_news(str(alert["ticker"]))
     snapshot = {
         "event_type": "option_market_snapshot",
         "snapshot_id": stable_hash([alert.get("source_dedupe_key"), contract_symbol, now_iso()])[:16],
@@ -391,12 +387,13 @@ def enrich_option_alert(alert: dict[str, Any]) -> dict[str, Any]:
         "dte": days_to_expiration(alert),
         "option_quote": option_quote,
         "underlying_quote": underlying_quote,
-        "underlying_indicators": underlying_indicators,
-        "spy_indicators": spy_indicators,
-        "qqq_indicators": qqq_indicators,
-        "recent_news": news,
         "data_provider": "alpaca",
     }
+    if include_context:
+        snapshot["underlying_indicators"] = indicator_snapshot(str(alert["ticker"]))
+        snapshot["spy_indicators"] = indicator_snapshot("SPY")
+        snapshot["qqq_indicators"] = indicator_snapshot("QQQ")
+        snapshot["recent_news"] = latest_news(str(alert["ticker"]))
     score, warnings = signal_score(alert, snapshot)
     snapshot["signal_score"] = score
     snapshot["signal_warnings"] = warnings
@@ -443,12 +440,28 @@ def build_option_sell_order_payload(position: dict[str, Any], contracts: int, tr
     }
 
 
+def options_market_open(env: dict[str, str]) -> tuple[bool, str]:
+    try:
+        _status, clock, _headers = alpaca_request("GET", "/v2/clock", env)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"alpaca_clock_unavailable:{exc}"
+    if bool(clock.get("is_open")):
+        return True, ""
+    next_open = str(clock.get("next_open") or "")
+    if next_open:
+        return False, f"options_market_closed:next_open={next_open}"
+    return False, "options_market_closed"
+
+
 def submit_option_paper_order(position: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] | None = None
     try:
         config, env_file = load_adapter_config()
         env = require_paper_environment(config, env_file, require_keys=True)
         payload = build_option_order_payload(position)
+        is_open, market_reason = options_market_open(env)
+        if not is_open:
+            raise AdapterError(market_reason)
         if not env.get("submit_enabled"):
             raise AdapterError("paper_order_submission_disabled")
         status, response, headers = alpaca_request("POST", "/v2/orders", env, payload)
@@ -468,6 +481,9 @@ def submit_option_paper_sell_order(position: dict[str, Any], contracts: int, rea
         config, env_file = load_adapter_config()
         env = require_paper_environment(config, env_file, require_keys=True)
         payload = build_option_sell_order_payload(position, contracts, trigger_key)
+        is_open, market_reason = options_market_open(env)
+        if not is_open:
+            raise AdapterError(market_reason)
         if not env.get("submit_enabled"):
             raise AdapterError("paper_order_submission_disabled")
         status, response, headers = alpaca_request("POST", "/v2/orders", env, payload)

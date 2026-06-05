@@ -287,6 +287,7 @@ Validation ledgers are append-only JSONL files under `data/`, including:
 ```text
 shadow_option_positions.jsonl
 option_quote_snapshots.jsonl
+option_tracking_state.json
 steve_option_exits.jsonl
 steve_approval_cards.jsonl
 steve_approval_actions.jsonl
@@ -295,6 +296,8 @@ human_paper_positions.jsonl
 human_paper_exits.jsonl
 daily_option_summaries.jsonl
 ```
+
+High-frequency quote tracking is intentionally lean. The bot keeps latest/high/low/threshold facts in `option_tracking_state.json` and only appends quote snapshot history when something useful changes: first observation, 5%+ price move by default, stop/take boundary, milestone hit, quote status change, or 30-minute checkpoint. Tune with `OPENCLAW_QUOTE_SNAPSHOT_MIN_MOVE_PCT` and `OPENCLAW_QUOTE_SNAPSHOT_FORCE_INTERVAL_SECONDS`. Nightly review runs a storage scorecard and archive-first compaction so active ledgers stay small without losing recoverable raw history.
 
 Generate a daily validation report:
 

@@ -21,7 +21,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from backfill_steve_text import build_raw_records, existing_keys
-from pipeline_common import CONFIG_DIR, DATA_DIR, LOG_DIR, append_jsonl, load_simple_yaml, now_iso, read_jsonl, setup_logging, stable_hash
+from data_hygiene import HEALTH_HISTORY_IGNORE_KEYS, browser_health_is_interesting
+from pipeline_common import CONFIG_DIR, DATA_DIR, LOG_DIR, append_jsonl, append_jsonl_if_changed, load_simple_yaml, now_iso, read_jsonl, setup_logging, stable_hash
 from run_pipeline_once import process_raw_notifications
 
 
@@ -163,11 +164,17 @@ def read_channel_snapshot_with_retries(
     last_error: Exception | None = None
     for attempt in range(max(1, retries + 1)):
         try:
-            return read_channel_snapshot(channel_url, timeout=timeout, first_load_delay=first_load_delay)
+            attempt_timeout = max(5, int(timeout + (attempt * 5)))
+            attempt_delay = max(0.0, float(first_load_delay) + (attempt * 0.75))
+            return read_channel_snapshot(channel_url, timeout=attempt_timeout, first_load_delay=attempt_delay)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
+            # Repeated AppleScript timeouts indicate foreground Chrome trouble;
+            # retrying them just stalls the audit path without producing truth.
+            if "timed out" in str(exc).lower():
+                break
             if attempt < retries:
-                time.sleep(1)
+                time.sleep(1 + attempt)
     raise RuntimeError(str(last_error) if last_error else "Chrome read failed")
 
 
@@ -334,7 +341,11 @@ def process_browser_messages(
         key = message_key(channel_id, message)
         if key in seen:
             continue
-        records = build_raw_records(str(message.get("text") or ""), source)
+        records = build_raw_records(
+            str(message.get("text") or ""),
+            source,
+            dedupe_scope=key,
+        )
         if mode != "mark":
             append_browser_message(channel_id, channel_url, message, records, mode)
         counts["messages_new"] += 1
@@ -438,7 +449,12 @@ def capture_once(
         record["channels"].append(channel_record)
     if record["errors"]:
         record["status"] = "degraded" if record["totals"]["channels_ok"] else "failed"
-    append_jsonl(BROWSER_HEALTH_FILE, record)
+    record["history_appended"] = append_jsonl_if_changed(
+        BROWSER_HEALTH_FILE,
+        record,
+        ignore_keys=HEALTH_HISTORY_IGNORE_KEYS,
+        always_append=browser_health_is_interesting(record),
+    )
     write_latest_json(BROWSER_HEALTH_LATEST_FILE, record)
     return record
 

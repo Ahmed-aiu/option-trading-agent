@@ -262,6 +262,23 @@ The latest OpenClaw-readable markdown summary is written to:
 ~/.openclaw/workspace/trading_alerts/latest_steve_options_validation.md
 ```
 
+## Storage Hygiene
+
+The pipeline keeps trading facts in JSONL, but high-frequency quote noise is reduced:
+
+- `option_tracking_state.json` keeps the latest, high, low, and threshold-hit facts per position.
+- `option_quote_snapshots.jsonl` only appends meaningful quote events: first observation, quote status change, stop/take boundary, milestone hit, 5%+ move by default, or 30-minute checkpoint.
+- Tune quote-history growth with `OPENCLAW_QUOTE_SNAPSHOT_MIN_MOVE_PCT` and `OPENCLAW_QUOTE_SNAPSHOT_FORCE_INTERVAL_SECONDS`; `option_tracking_state.json` still keeps latest/high/low facts from observed quotes.
+- Nightly review includes a storage scorecard and archive-first compaction. Active ledgers are rewritten only when enough space is saved; originals are gzip archived under `data/archive/`.
+
+Manual checks:
+
+```sh
+python3 scripts/data_hygiene.py scorecard --print-json
+python3 scripts/data_hygiene.py compact --print-json --min-saved-bytes 262144
+python3 scripts/data_hygiene.py compact --apply --print-json --min-saved-bytes 262144
+```
+
 ## Clean Test Session
 
 ```sh

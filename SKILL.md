@@ -11,6 +11,8 @@ Make tomorrow's paper-trading pipeline better at immediately following Steve's o
 - Entering paper trades quickly and deterministically.
 - Reconciling local paper state with Alpaca paper state.
 - Producing enough audit data to explain every miss, duplicate, late order, and broker failure.
+- Keeping runtime ledgers compact enough to remain useful: store high-frequency facts once, dedupe repeated states, and archive before removing noisy rows.
+- Reporting local policy P/L, broker-fill P/L, and Steve-alert-price P/L separately so comparisons never mix quote exits, filled broker prices, and Steve's posted buy/sell prices.
 
 This system is paper-only. Never weaken the hard guard that refuses non-paper Alpaca endpoints or live trading.
 
@@ -38,10 +40,15 @@ Every weekday after market close:
    - `broker_order_status_reports.jsonl`
    - `pipeline_health_checks.jsonl`
    - `daily_pl_reports.jsonl`
+   - `steve_alert_pl_reports.jsonl`
+   - `broker_fill_pl_reports.jsonl`
+   - `data_hygiene_reports.jsonl`
 5. Classify each issue by root cause, not symptom.
-6. Apply code/config/test updates needed for the next trading day.
-7. Run tests before making changes live.
-8. Send a short Telegram summary of what changed and what still needs human judgement.
+6. Build an evidence-driven improvement plan: observed facts, hypotheses, missing data, instrumentation to add, candidate experiments, validation, and rollback criteria.
+7. Apply only changes that are justified by the evidence and safe for tomorrow's paper-only session. Prefer adding observability before changing behavior when the root cause is uncertain.
+8. Run tests before making changes live.
+9. Send a short Telegram summary of what changed, what is still a hypothesis, and what data the next real session should collect.
+10. If browser refresh or browser health shows repeated `Chrome AppleScript read timed out` errors across channels, treat it as a foreground-browser recovery issue, not a parser issue: keep browser truth as the audit source, avoid guessing missing alerts, and restart browser capture with `scripts/run_browser_watcher_foreground.sh` for the next session instead of assuming the background LaunchAgent is sufficient.
 
 ## Source Of Truth Rules
 
@@ -63,9 +70,21 @@ Every nightly review must compare capture methods instead of guessing:
 - If browser is primary and average capture latency is still high, lower `browser_watcher_interval_seconds` cautiously; start at 5 seconds and only consider 3 seconds when data shows the extra load is needed.
 - If notifications outperform browser, keep the browser watcher running anyway because browser history is still the source-of-truth audit path.
 
+## Data Hygiene Scorecard
+
+Every nightly review must also check whether the data being collected is still useful:
+
+- Track ledger size, rows, duplicate quote signatures, synthetic/test rows, unavailable quote rate, and repeated health/heartbeat states.
+- Runtime option writers must reject `full-*` synthetic test source keys in project data files.
+- High-frequency option tracking should store lean quote snapshots and avoid repeating news or indicator payloads every tick.
+- Preserve useful high-frequency facts in latest-state files: latest price, max/min price, threshold hits, and stop/take boundary observations.
+- Health and heartbeat histories should append on status change or meaningful activity; latest-state JSON files carry liveness.
+- Any compaction must be archive-first. Keep the original ignored runtime ledger under `data/archive/` before rewriting the active ledger.
+- Use `python3 scripts/data_hygiene.py scorecard --print-json` to inspect storage health and `python3 scripts/data_hygiene.py compact --apply --print-json` only when the archive-first compaction result is understood.
+
 ## Auto-Fix Policy
 
-Allowed automatic changes:
+Allowed automatic changes when evidence supports them:
 
 - Parser support for newly observed Steve formats.
 - Capture/dedupe improvements.
@@ -79,7 +98,11 @@ Allowed automatic changes:
 Allowed paper-trading policy changes:
 
 - Make paper routing faster and more complete when the alert is unambiguous.
-- Add slippage, stale-quote, near-close, or wide-spread guardrails when data shows bad execution.
+- Add slippage, stale-quote, near-close, or wide-spread guardrails when data shows bad execution and the likely cause is understood.
+- Treat repeated `entry_price_worse_than_alert` findings as an investigation trigger: compare capture latency, quote age, spread, order timing, and fill quality before tightening auto-entry behavior.
+- Keep alert-price slippage caps explicit and configurable (`OPENCLAW_MAX_ENTRY_SLIPPAGE_PCT`) so approval/default fills do not blindly chase stale quotes above policy.
+- For options, block local paper order submission outside market hours when the broker clock or repeated rejects show it is predictable; otherwise collect the clock/order evidence first.
+- Treat `local_position_without_broker_fill`, `submitted_broker_order_unresolved`, and `local_pnl_differs_from_broker_fills` as reconciliation signals: local paper state, broker-fill state, and Steve-alert state must stay separate, and nightly should explain the relationship before changing behavior.
 - Change default paper behavior for ambiguous Steve alerts only when the nightly report explains the default and Telegram receives a short notice.
 
 Never auto-change:
@@ -111,6 +134,7 @@ After changes:
 
 - If tests pass, make the changes live for the next day by restarting only the relevant local paper pipeline services.
 - If tests fail, do not deploy. Send Telegram with the failing test and the safest fallback.
+- If tests pass and the report shows stale/degraded browser capture from AppleScript timeouts, restart only the relevant local paper services and prefer the interactive browser watcher path for the next market session so Chrome channel reads happen from a foreground Terminal.
 
 ## Human-Judgement Cases
 

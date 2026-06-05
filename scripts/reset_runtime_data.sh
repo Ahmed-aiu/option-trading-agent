@@ -31,7 +31,8 @@ for file in \
   discord_browser_messages.jsonl \
   discord_browser_health.jsonl \
   pipeline_health_checks.jsonl \
-  pipeline_health_alerts.jsonl
+  pipeline_health_alerts.jsonl \
+  data_hygiene_reports.jsonl
 do
   if [ -f "$PROJECT_DIR/data/$file" ]; then
     mv "$PROJECT_DIR/data/$file" "$ARCHIVE_DIR/$file"

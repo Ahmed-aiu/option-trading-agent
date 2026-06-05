@@ -83,11 +83,12 @@ def parsed_items_for_body(body: str, dedupe_key: str) -> list[dict[str, Any]]:
     return normalize_parsed(value)
 
 
-def build_raw_records(text: str, source: str) -> list[dict[str, Any]]:
+def build_raw_records(text: str, source: str, dedupe_scope: str | None = None) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     last_entry_context = ""
+    dedupe_seed = dedupe_scope or source
     for line in useful_lines(text):
-        key = "ui-" + stable_hash([source, line])[:24]
+        key = "ui-" + stable_hash([dedupe_seed, line])[:24]
         parsed = parsed_items_for_body(line, key)
         entries = [item for item in parsed if is_option_entry(item)]
         exits = [item for item in parsed if is_option_exit(item)]
@@ -109,7 +110,7 @@ def build_raw_records(text: str, source: str) -> list[dict[str, Any]]:
                 "subtitle": source,
                 "body": body,
                 "raw": {"source": source, "line": line},
-                "dedupe_key": "ui-" + stable_hash([source, body])[:24],
+                "dedupe_key": "ui-" + stable_hash([dedupe_seed, body])[:24],
             }
         )
     return unique_records(records)

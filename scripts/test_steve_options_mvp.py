@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import alpaca_options
 import backfill_steve_text
 import broker_order_monitor
+import data_hygiene
 import discord_browser_channel_watcher
 import discord_chrome_visible_capture
 import notification_watcher
@@ -46,6 +47,7 @@ def fake_snapshot(alert: dict) -> dict:
             "ask": 0.9,
             "mark": 0.88,
             "spread_pct": 4.54,
+            "timestamp": dt.datetime.now(ZoneInfo("America/Detroit")).isoformat(timespec="seconds"),
         },
         "underlying_indicators": {
             "status": "ok",
@@ -62,11 +64,13 @@ def fake_snapshot(alert: dict) -> dict:
 def patch_runtime_paths(tmp_path: Path) -> None:
     option_validation.SHADOW_POSITIONS_FILE = tmp_path / "shadow_option_positions.jsonl"
     option_validation.QUOTE_SNAPSHOTS_FILE = tmp_path / "option_quote_snapshots.jsonl"
+    option_validation.TRACKING_STATE_FILE = tmp_path / "option_tracking_state.json"
     option_validation.STEVE_EXITS_FILE = tmp_path / "steve_option_exits.jsonl"
     option_validation.HUMAN_POSITIONS_FILE = tmp_path / "human_paper_positions.jsonl"
     option_validation.HUMAN_EXITS_FILE = tmp_path / "human_paper_exits.jsonl"
     option_validation.DAILY_SUMMARIES_FILE = tmp_path / "daily_option_summaries.jsonl"
     option_validation.DAILY_PL_REPORTS_FILE = tmp_path / "daily_pl_reports.jsonl"
+    option_validation.STEVE_ALERT_PL_REPORTS_FILE = tmp_path / "steve_alert_pl_reports.jsonl"
     option_validation.submit_option_paper_sell_order = lambda position, contracts, reason, trigger_key: {
         "status": "submitted",
         "reason": "",
@@ -86,6 +90,9 @@ def patch_runtime_paths(tmp_path: Path) -> None:
     broker_order_monitor.ORDER_STATUS_FILE = tmp_path / "broker_order_status_reports.jsonl"
     nightly_review.NIGHTLY_DIR = tmp_path / "nightly_reviews"
     nightly_review.NIGHTLY_SUMMARY_FILE = tmp_path / "nightly_review_reports.jsonl"
+    nightly_review.NIGHTLY_TELEGRAM_FILE = tmp_path / "nightly_telegram_reports.jsonl"
+    nightly_review.STEVE_ALERT_PL_FILE = tmp_path / "steve_alert_pl_reports.jsonl"
+    nightly_review.BROKER_FILL_PL_FILE = tmp_path / "broker_fill_pl_reports.jsonl"
     nightly_review.BROWSER_MESSAGES_FILE = tmp_path / "discord_browser_messages.jsonl"
     nightly_review.RAW_FILE = tmp_path / "raw_notifications.jsonl"
     nightly_review.PARSED_FILE = tmp_path / "parsed_alerts.jsonl"
@@ -163,6 +170,7 @@ def test_parser() -> None:
     )
     assert author_only_exit["side"] == "exit"
     assert author_only_exit["ticker"] is None
+
 
 
 def test_validation_and_approval() -> None:
@@ -271,7 +279,7 @@ def test_validation_and_approval() -> None:
         assert positions[0]["take_percent"] == 50.0
         assert positions[0]["alert_contracts"] == 10
         assert positions[0]["exit_plan"] == [
-            {"action": "sell", "contracts": 1, "take_percent": 50.0, "take_price": 1.32}
+            {"action": "sell", "contracts": 1, "take_percent": 50.0, "take_price": 1.35}
         ]
 
         duplicate = steve_trade_bot.process_approval_message(
@@ -343,16 +351,16 @@ def test_non_hedge_auto_paper_buy() -> None:
         assert positions[0]["stop_percent"] == 35.0
         assert positions[0]["take_percent"] == 80.0
         assert positions[0]["exit_plan"] == [
-            {"action": "sell", "contracts": 2, "take_percent": 80.0, "take_price": 1.58},
-            {"action": "sell", "contracts": 1, "take_percent": 120.0, "take_price": 1.94},
-            {"action": "sell", "contracts": 2, "take_percent": 200.0, "take_price": 2.64},
+            {"action": "sell", "contracts": 2, "take_percent": 80.0, "take_price": 1.62},
+            {"action": "sell", "contracts": 1, "take_percent": 120.0, "take_price": 1.98},
+            {"action": "sell", "contracts": 2, "take_percent": 200.0, "take_price": 2.7},
         ]
 
         reports = read_jsonl(steve_trade_bot.AUTO_BUY_REPORTS_FILE)
         assert len(reports) == 1
         assert reports[0]["status"] == "sent"
         assert "AUTO PAPER BUY" in reports[0]["message_text"]
-        assert "Bought 5 @ 0.88" in reports[0]["message_text"]
+        assert "Bought 5 @ 0.90" in reports[0]["message_text"]
         assert "Takes: 2 @ +80%, 1 @ +120%, 2 @ +200%" in reports[0]["message_text"]
         assert len(sent_messages) == 2
 
@@ -360,6 +368,100 @@ def test_non_hedge_auto_paper_buy() -> None:
         assert duplicate["auto_buy"]["created"] is False
         assert len(read_jsonl(steve_trade_bot.HUMAN_POSITIONS_FILE)) == 1
         assert len(read_jsonl(steve_trade_bot.AUTO_BUY_REPORTS_FILE)) == 1
+
+
+def test_non_hedge_bad_entry_requires_approval() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        sent_messages: list[tuple[str, str]] = []
+
+        def moved_snapshot(alert: dict) -> dict:
+            snapshot = fake_snapshot(alert)
+            snapshot["option_quote"]["bid"] = 1.06
+            snapshot["option_quote"]["ask"] = 1.1
+            snapshot["option_quote"]["mark"] = 1.08
+            return snapshot
+
+        option_validation.enrich_option_alert = moved_snapshot
+        steve_trade_bot.load_bot_config = lambda required=False: steve_trade_bot.BotConfig(
+            token="test",
+            approval_chat_id="123456789",
+            owner_chat_id="123456789",
+            owner_user_id="123456789",
+            approval_chat_ids=("123456789",),
+        )
+        steve_trade_bot.send_telegram_message = lambda config, text, chat_id=None: (
+            sent_messages.append((str(chat_id or config.approval_chat_id), text))
+            or {"ok": True, "result": {"message_id": len(sent_messages), "chat": {"id": chat_id or config.approval_chat_id}}}
+        )
+
+        def fail_submit(position: dict) -> dict:
+            raise AssertionError("bad entry guard should not submit a paper order")
+
+        steve_trade_bot.submit_option_paper_order = fail_submit
+        alert = parsed_records(
+            parse_trade_alert(
+                {
+                    "captured_at": "2026-05-08T13:09:00-04:00",
+                    "dedupe_key": "screen-slippage-001",
+                    "body": "#CRWV MAY 8 113 call @ .88 Bought 5 #swing",
+                }
+            )
+        )[0]
+        result = option_validation.handle_option_entry(alert, send_approval=True)
+        assert result["route"] == "approval_required"
+        assert result["route_reason"] == "auto_entry_guard"
+        assert "entry_price_above_alert_threshold" in result["auto_entry_guard"]["reasons"]
+        assert result["auto_buy"] == {}
+        assert read_jsonl(steve_trade_bot.HUMAN_POSITIONS_FILE) == []
+        cards = read_jsonl(steve_trade_bot.APPROVAL_CARDS_FILE)
+        assert len(cards) == 1
+        assert "Auto buy held" in cards[0]["message_text"]
+        assert "price moved beyond threshold" in cards[0]["message_text"]
+        assert len(sent_messages) == 1
+
+
+def test_non_hedge_mixed_buy_exit_requires_approval() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        option_validation.enrich_option_alert = fake_snapshot
+        steve_trade_bot.load_bot_config = lambda required=False: None
+
+        alert = parsed_records(
+            parse_trade_alert(
+                {
+                    "captured_at": "2026-05-08T13:09:00-04:00",
+                    "dedupe_key": "screen-mixed-001",
+                    "body": "#IREN JUN 18 60 call @ 4.65 Bought 5 #swing",
+                }
+            )
+        )[0]
+        alert["raw_text"] = "#IREN JUN 18 60 call @ 4.65 Bought 5 #swing\nsold 3 @ 11.60"
+        result = option_validation.handle_option_entry(alert, send_approval=True)
+        assert result["route"] == "approval_required"
+        assert result["route_reason"] == "auto_entry_guard"
+        assert "mixed_buy_exit_message" in result["auto_entry_guard"]["reasons"]
+        assert read_jsonl(steve_trade_bot.HUMAN_POSITIONS_FILE) == []
+
+
+def test_fill_price_caps_excessive_slippage() -> None:
+    card = {
+        "approval_id": "card-slippage-cap",
+        "alert": {"entry_price": 4.70},
+        "snapshot": {
+            "option_quote": {
+                "status": "ok",
+                "ask": 8.40,
+                "mark": 8.20,
+                "timestamp": dt.datetime.now(ZoneInfo("America/Detroit")).isoformat(timespec="seconds"),
+            }
+        },
+    }
+    price, source = steve_trade_bot.fill_price_from_card(card)
+    assert price == 4.94
+    assert source == "current_ask_slippage_capped"
 
 
 def test_exit_plan_contract_allocation() -> None:
@@ -562,6 +664,58 @@ def test_human_exit_rules_and_steve_catch_up() -> None:
         assert catch_up[0]["reason"] == "steve_exit_catch_up"
         assert catch_up[0]["contracts"] == 2
         assert catch_up[0]["remaining_after_exit"] == 1
+
+
+def test_steve_alert_pl_summary_uses_steve_prices() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        day = "2026-05-28"
+        append_jsonl(
+            option_validation.SHADOW_POSITIONS_FILE,
+            {
+                "event_type": "shadow_option_position",
+                "position_id": "shadow-steve-pl",
+                "opened_at": f"{day}T10:00:00-04:00",
+                "source_dedupe_key": "ui-steve-pl",
+                "ticker": "AAPL",
+                "contract_symbol": "AAPL260618C00310000",
+                "option_type": "call",
+                "expiration_date": "2026-06-18",
+                "strike_price": 310.0,
+                "contracts": 5,
+                "alert_entry_price": 2.0,
+                "bot_entry_price": 3.0,
+            },
+        )
+        append_jsonl(
+            option_validation.STEVE_EXITS_FILE,
+            {
+                "event_type": "steve_option_exit",
+                "exit_id": "exit-steve-pl",
+                "recorded_at": f"{day}T15:00:00-04:00",
+                "matched_shadow_position_id": "shadow-steve-pl",
+                "ticker": "AAPL",
+                "contracts": 2,
+                "exit_price": 4.0,
+            },
+        )
+        append_jsonl(
+            option_validation.QUOTE_SNAPSHOTS_FILE,
+            {
+                "recorded_at": f"{day}T15:59:00-04:00",
+                "position_id": "shadow-steve-pl",
+                "contract_symbol": "AAPL260618C00310000",
+                "option_quote": {"mark": 3.0},
+            },
+        )
+        summary = option_validation.compute_steve_alert_pl_summary(day)
+        assert summary["basis"] == "steve_buy_alert_and_steve_sell_alert_prices"
+        assert summary["realized_pnl"] == 400.0
+        assert summary["open_pnl"] == 300.0
+        assert summary["total_pnl"] == 700.0
+        assert summary["contracts_closed"] == 2
+        assert summary["open_contracts"] == 3
 
 
 def test_option_exit_reply_matches_shadow_context() -> None:
@@ -928,15 +1082,102 @@ def test_live_pipeline_heartbeat() -> None:
             run_live_pipeline.HEARTBEAT_FILE = heartbeat_file
             run_live_pipeline.HEARTBEAT_HISTORY_FILE = heartbeat_history_file
             run_live_pipeline.write_heartbeat({"event_type": "live_pipeline_heartbeat", "capture_written": 0})
+            run_live_pipeline.write_heartbeat({"event_type": "live_pipeline_heartbeat", "capture_written": 0})
             heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))
             history = read_jsonl(heartbeat_history_file)
             assert heartbeat["event_type"] == "live_pipeline_heartbeat"
             assert heartbeat["capture_written"] == 0
+            assert heartbeat["history_appended"] is False
+            assert len(history) == 1
             assert history[-1]["event_type"] == "live_pipeline_heartbeat"
             assert history[-1]["capture_written"] == 0
+            snapshot_only = {
+                "event_type": "live_pipeline_heartbeat",
+                "capture_written": 0,
+                "option_tracking": {"snapshots": 3, "human_exits": 0},
+            }
+            run_live_pipeline.write_heartbeat(snapshot_only)
+            run_live_pipeline.write_heartbeat(snapshot_only)
+            assert len(read_jsonl(heartbeat_history_file)) == 2
+            run_live_pipeline.write_heartbeat({"event_type": "live_pipeline_heartbeat", "capture_written": 1})
+            assert len(read_jsonl(heartbeat_history_file)) == 3
         finally:
             run_live_pipeline.HEARTBEAT_FILE = original
             run_live_pipeline.HEARTBEAT_HISTORY_FILE = original_history
+
+
+def test_option_tracker_skips_junk_and_writes_lean_deduped_snapshots() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        original_enrich = option_validation.enrich_option_alert
+        original_now_iso = option_validation.now_iso
+        try:
+            option_validation.enrich_option_alert = fake_snapshot
+            option_validation.now_iso = lambda tz_name="America/Detroit": "2026-05-29T10:00:00-04:00"
+            for row in (
+                {
+                    "event_type": "shadow_option_position",
+                    "position_id": "shadow-synthetic",
+                    "opened_at": "2026-05-29T09:55:00-04:00",
+                    "source_dedupe_key": "full-option-synthetic",
+                    "ticker": "AAPL",
+                    "contract_symbol": "AAPL260619C00150000",
+                    "expiration_date": "2026-06-19",
+                    "option_type": "call",
+                    "strike_price": 150.0,
+                    "contracts": 1,
+                },
+                {
+                    "event_type": "shadow_option_position",
+                    "position_id": "shadow-expired",
+                    "opened_at": "2026-05-29T09:55:00-04:00",
+                    "source_dedupe_key": "real-expired",
+                    "ticker": "AAPL",
+                    "contract_symbol": "AAPL260515C00150000",
+                    "expiration_date": "2026-05-15",
+                    "option_type": "call",
+                    "strike_price": 150.0,
+                    "contracts": 1,
+                },
+                {
+                    "event_type": "shadow_option_position",
+                    "position_id": "shadow-real",
+                    "opened_at": "2026-05-29T09:55:00-04:00",
+                    "source_dedupe_key": "real-option-1",
+                    "ticker": "AAPL",
+                    "contract_symbol": "AAPL260619C00150000",
+                    "expiration_date": "2026-06-19",
+                    "option_type": "call",
+                    "strike_price": 150.0,
+                    "contracts": 1,
+                },
+            ):
+                append_jsonl(option_validation.SHADOW_POSITIONS_FILE, row)
+
+            counts = option_validation.track_open_positions_once()
+            assert counts["snapshots"] == 1
+            assert counts["skipped_synthetic"] == 1
+            assert counts["skipped_expired"] == 1
+            rows = read_jsonl(option_validation.QUOTE_SNAPSHOTS_FILE)
+            assert len(rows) == 1
+            assert rows[0]["storage_profile"] == "tracking_core_v1"
+            assert "recent_news" not in rows[0]
+            assert "spy_indicators" not in rows[0]
+            state = json.loads(option_validation.TRACKING_STATE_FILE.read_text(encoding="utf-8"))
+            assert state["positions"]["shadow-real"]["latest_price"] == 0.88
+            assert state["positions"]["shadow-real"]["max_price"] == 0.88
+            assert state["positions"]["shadow-real"]["min_price"] == 0.88
+
+            second_counts = option_validation.track_open_positions_once()
+            assert second_counts["skipped_not_due"] == 1
+            assert len(read_jsonl(option_validation.QUOTE_SNAPSHOTS_FILE)) == 1
+            scorecard = data_hygiene.data_hygiene_scorecard(tmp_path)
+            assert scorecard["files"]["option_quote_snapshots.jsonl"]["synthetic_rows"] == 0
+            assert scorecard["files"]["option_tracking_state.json"]["positions"] == 1
+        finally:
+            option_validation.enrich_option_alert = original_enrich
+            option_validation.now_iso = original_now_iso
 
 
 def test_browser_channel_watcher_filters_and_backfills() -> None:
@@ -983,6 +1224,127 @@ def test_browser_channel_watcher_filters_and_backfills() -> None:
             discord_browser_channel_watcher.DATA_DIR = original_data_dir
             discord_browser_channel_watcher.BROWSER_MESSAGES_FILE = original_messages
             discord_browser_channel_watcher.BROWSER_STATE_FILE = original_state
+
+
+def test_browser_channel_watcher_keeps_identical_text_on_new_message_ids() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        original_data_dir = discord_browser_channel_watcher.DATA_DIR
+        original_messages = discord_browser_channel_watcher.BROWSER_MESSAGES_FILE
+        original_state = discord_browser_channel_watcher.BROWSER_STATE_FILE
+        try:
+            discord_browser_channel_watcher.DATA_DIR = tmp_path
+            discord_browser_channel_watcher.BROWSER_MESSAGES_FILE = tmp_path / "discord_browser_messages.jsonl"
+            discord_browser_channel_watcher.BROWSER_STATE_FILE = tmp_path / "discord_browser_state.json"
+            first = {
+                "id": "chat-messages-562178552984764436-1509647449315213454",
+                "text": "OTWSteve\n#AAPL Jun 18 310 call @ 4.70 Bought 3 #swing\nThursday, May 28, 2026 at 3:59 PM",
+            }
+            second = {
+                "id": "chat-messages-562178552984764436-1511450171756642355",
+                "text": "OTWSteve\n#AAPL Jun 18 310 call @ 4.70 Bought 3 #swing\nTuesday, June 2, 2026 at 3:23 PM",
+            }
+            candidates = discord_browser_channel_watcher.filter_candidate_messages(
+                [first, second],
+                ["OTWSteve", "SteveOTWS"],
+                max_age_minutes=0,
+                tz_name="America/Detroit",
+                allow_unknown_time=False,
+            )
+            counts = discord_browser_channel_watcher.process_browser_messages(
+                "562178552984764436",
+                "https://discord.com/channels/483483452180791296/562178552984764436",
+                candidates,
+                mode="live",
+                source_prefix="browser_channel",
+                process_raw=False,
+            )
+            assert counts["messages_new"] == 2
+            assert counts["raw_backfilled"] == 2
+            raw = read_jsonl(tmp_path / "raw_notifications.jsonl")
+            assert len(raw) == 2
+            assert raw[0]["body"] == raw[1]["body"]
+            assert raw[0]["dedupe_key"] != raw[1]["dedupe_key"]
+        finally:
+            discord_browser_channel_watcher.DATA_DIR = original_data_dir
+            discord_browser_channel_watcher.BROWSER_MESSAGES_FILE = original_messages
+            discord_browser_channel_watcher.BROWSER_STATE_FILE = original_state
+
+
+def test_browser_channel_watcher_reprocesses_identical_text_as_distinct_buys() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        original_browser_data_dir = discord_browser_channel_watcher.DATA_DIR
+        original_messages = discord_browser_channel_watcher.BROWSER_MESSAGES_FILE
+        original_state = discord_browser_channel_watcher.BROWSER_STATE_FILE
+        original_pipeline_data_dir = run_pipeline_once.DATA_DIR
+        original_processed_file = run_pipeline_once.PROCESSED_FILE
+        original_summary = run_pipeline_once.write_openclaw_summary
+        original_enrich = option_validation.enrich_option_alert
+        original_load_bot_config = steve_trade_bot.load_bot_config
+        try:
+            discord_browser_channel_watcher.DATA_DIR = tmp_path
+            discord_browser_channel_watcher.BROWSER_MESSAGES_FILE = tmp_path / "discord_browser_messages.jsonl"
+            discord_browser_channel_watcher.BROWSER_STATE_FILE = tmp_path / "discord_browser_state.json"
+            run_pipeline_once.DATA_DIR = tmp_path
+            run_pipeline_once.PROCESSED_FILE = tmp_path / "processed_notifications.jsonl"
+            run_pipeline_once.write_openclaw_summary = lambda decision: None
+            option_validation.enrich_option_alert = fake_snapshot
+            steve_trade_bot.load_bot_config = lambda required=False: None
+
+            candidates = discord_browser_channel_watcher.filter_candidate_messages(
+                [
+                    {
+                        "id": "chat-messages-562178552984764436-1509647449315213454",
+                        "text": "OTWSteve\n#AAPL Jun 18 310 call @ 4.70 Bought 3 #swing\nThursday, May 28, 2026 at 3:59 PM",
+                    },
+                    {
+                        "id": "chat-messages-562178552984764436-1511450171756642355",
+                        "text": "OTWSteve\n#AAPL Jun 18 310 call @ 4.70 Bought 3 #swing\nTuesday, June 2, 2026 at 3:23 PM",
+                    },
+                ],
+                ["OTWSteve", "SteveOTWS"],
+                max_age_minutes=0,
+                tz_name="America/Detroit",
+                allow_unknown_time=False,
+            )
+            counts = discord_browser_channel_watcher.process_browser_messages(
+                "562178552984764436",
+                "https://discord.com/channels/483483452180791296/562178552984764436",
+                candidates,
+                mode="live",
+                source_prefix="browser_channel",
+                process_raw=False,
+            )
+            assert counts["messages_new"] == 2
+            assert counts["raw_backfilled"] == 2
+
+            pipeline_counts = process_raw_notifications(
+                read_jsonl(tmp_path / "raw_notifications.jsonl"),
+                dry_run_orders=True,
+                prior_decisions_override=[],
+            )
+            assert pipeline_counts["raw_new"] == 2
+            assert pipeline_counts["parsed"] == 2
+            parsed_buys = [
+                row
+                for row in read_jsonl(tmp_path / "parsed_alerts.jsonl")
+                if row.get("side") == "buy" and row.get("ticker") == "AAPL"
+            ]
+            assert len(parsed_buys) == 2
+            assert {row["source_dedupe_key"] for row in parsed_buys} == {
+                row["dedupe_key"] for row in read_jsonl(tmp_path / "raw_notifications.jsonl")
+            }
+        finally:
+            discord_browser_channel_watcher.DATA_DIR = original_browser_data_dir
+            discord_browser_channel_watcher.BROWSER_MESSAGES_FILE = original_messages
+            discord_browser_channel_watcher.BROWSER_STATE_FILE = original_state
+            run_pipeline_once.DATA_DIR = original_pipeline_data_dir
+            run_pipeline_once.PROCESSED_FILE = original_processed_file
+            run_pipeline_once.write_openclaw_summary = original_summary
+            option_validation.enrich_option_alert = original_enrich
+            steve_trade_bot.load_bot_config = original_load_bot_config
 
 
 def test_pipeline_health_pinpoints_stage_failures() -> None:
@@ -1201,6 +1563,216 @@ def test_nightly_review_capture_method_scorecard() -> None:
         assert scorecard["recommendation"]["recommended_primary"] == "browser"
 
 
+def test_nightly_review_browser_refresh_overrides_stale_health_and_surfaces_current_errors() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        day = "2026-05-26"
+        append_jsonl(
+            nightly_review.PIPELINE_HEALTH_FILE,
+            {
+                "event_type": "pipeline_health_check",
+                "recorded_at": f"{day}T10:00:00-04:00",
+                "status": "critical",
+                "issues": [
+                    {
+                        "stage": "browser_capture",
+                        "code": "browser_health_stale",
+                        "severity": "critical",
+                        "message": "Browser capture health is stale.",
+                    },
+                    {
+                        "stage": "browser_capture",
+                        "code": "browser_capture_degraded",
+                        "severity": "critical",
+                        "message": "Browser capture reported channel read errors.",
+                    },
+                ],
+            },
+        )
+        original_truth_events_from_chrome = nightly_review.truth_events_from_chrome
+        try:
+            nightly_review.truth_events_from_chrome = lambda *args, **kwargs: (
+                [],
+                [{"channel_id": "492098253337264138", "status": "ok", "events": 0}],
+            )
+            healthy_report = nightly_review.review_day(day, refresh_browser=True)
+            healthy_codes = {item["code"] for item in healthy_report["issues"]}
+            assert "health_browser_health_stale" not in healthy_codes
+            assert "health_browser_capture_degraded" not in healthy_codes
+
+            nightly_review.truth_events_from_chrome = lambda *args, **kwargs: (
+                [],
+                [{"channel_id": "492098253337264138", "status": "error", "reason": "RuntimeError:Chrome AppleScript read timed out", "events": 0}],
+            )
+            error_report = nightly_review.review_day(day, refresh_browser=True)
+            error_codes = {item["code"] for item in error_report["issues"]}
+            assert "browser_refresh_channel_error" in error_codes
+        finally:
+            nightly_review.truth_events_from_chrome = original_truth_events_from_chrome
+
+
+def test_nightly_review_ignores_synthetic_full_pipeline_artifacts() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        day = "2026-05-21"
+        for key in ("full-option-abc123", "full-option-def456"):
+            append_jsonl(
+                nightly_review.HUMAN_POSITIONS_FILE,
+                {
+                    "event_type": "human_paper_option_position",
+                    "opened_at": f"{day}T00:10:00-04:00",
+                    "position_id": f"pos-{key}",
+                    "source_dedupe_key": key,
+                    "ticker": "NVDA",
+                    "expiration_date": "2026-05-15",
+                    "strike_price": 215.0,
+                    "option_type": "call",
+                    "entry_price": 7.15,
+                    "contracts": 3,
+                },
+            )
+            append_jsonl(
+                nightly_review.ORDERS_FILE,
+                {
+                    "event_type": "alpaca_option_paper_order_audit",
+                    "recorded_at": f"{day}T00:10:01-04:00",
+                    "source_dedupe_key": key,
+                    "status": "blocked",
+                    "ticker": "NVDA",
+                    "contract_symbol": "NVDA260515C00215000",
+                    "reason": 'Alpaca HTTP 422: {"code": 42210000, "message": "asset not found"}',
+                    "payload": {"side": "buy", "qty": "3"},
+                },
+            )
+
+        report = nightly_review.review_day(day, refresh_browser=False)
+        issue_codes = {item["code"] for item in report["issues"]}
+        assert "duplicate_paper_position" not in issue_codes
+        assert "broker_error" not in issue_codes
+        assert report["counts"]["filtered_test_artifacts"] >= 4
+
+
+def test_nightly_review_compares_steve_local_and_broker_pl() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        patch_runtime_paths(tmp_path)
+        day = "2026-05-28"
+        append_jsonl(
+            nightly_review.ORDERS_FILE,
+            {
+                "event_type": "alpaca_option_paper_order_audit",
+                "recorded_at": f"{day}T15:59:59-04:00",
+                "status": "submitted",
+                "ticker": "AAPL",
+                "contract_symbol": "AAPL260618C00310000",
+                "position_id": "human-unfilled",
+                "payload": {"side": "buy", "qty": "3"},
+                "response": {"id": "order-unfilled", "status": "accepted"},
+                "source_dedupe_key": "ui-unfilled",
+            },
+        )
+        append_jsonl(
+            nightly_review.HUMAN_POSITIONS_FILE,
+            {
+                "event_type": "human_paper_option_position",
+                "opened_at": f"{day}T10:00:00-04:00",
+                "position_id": "human-broker-pl",
+                "source_dedupe_key": "ui-broker-pl",
+                "ticker": "MS",
+                "contract_symbol": "MS260529C00200000",
+                "option_type": "call",
+                "expiration_date": "2026-05-29",
+                "strike_price": 200.0,
+                "contracts": 1,
+                "entry_price": 2.0,
+            },
+        )
+        append_jsonl(
+            nightly_review.HUMAN_EXITS_FILE,
+            {
+                "event_type": "human_paper_option_exit",
+                "recorded_at": f"{day}T11:00:00-04:00",
+                "position_id": "human-broker-pl",
+                "ticker": "MS",
+                "contract_symbol": "MS260529C00200000",
+                "option_type": "call",
+                "expiration_date": "2026-05-29",
+                "strike_price": 200.0,
+                "contracts": 1,
+                "entry_price": 2.0,
+                "exit_price": 3.0,
+                "pnl_dollars": 100.0,
+                "broker_client_order_id": "exit-broker-pl",
+            },
+        )
+        for row in (
+            {
+                "event_type": "broker_order_status_report",
+                "recorded_at": f"{day}T10:00:05-04:00",
+                "order_id": "entry-broker-pl",
+                "client_order_id": "entry-broker-pl",
+                "broker_status": "filled",
+                "position_id": "human-broker-pl",
+                "source_dedupe_key": "ui-broker-pl",
+                "contract_symbol": "MS260529C00200000",
+                "side": "buy",
+                "filled_qty": "1",
+                "filled_avg_price": "2.00",
+            },
+            {
+                "event_type": "broker_order_status_report",
+                "recorded_at": f"{day}T11:00:05-04:00",
+                "order_id": "exit-broker-pl",
+                "client_order_id": "exit-broker-pl",
+                "broker_status": "filled",
+                "position_id": "human-broker-pl",
+                "source_dedupe_key": "ui-broker-pl",
+                "contract_symbol": "MS260529C00200000",
+                "side": "sell",
+                "filled_qty": "1",
+                "filled_avg_price": "1.00",
+            },
+        ):
+            append_jsonl(nightly_review.BROKER_STATUS_FILE, row)
+        report = nightly_review.review_day(day, refresh_browser=False)
+        codes = {item["code"] for item in report["issues"]}
+        assert "submitted_broker_order_unresolved" in codes
+        assert "local_pnl_differs_from_broker_fills" in codes
+        assert report["broker_fill_pl"]["realized_pnl"] == -100.0
+        assert report["steve_alert_pl"]["basis"] == "steve_buy_alert_and_steve_sell_alert_prices"
+        assert any(item["auto_fixable"] for item in report["recursive_improvement_plan"])
+
+
+def test_nightly_review_recommended_actions_include_health_fallbacks() -> None:
+    issues = [
+        {
+            "severity": "critical",
+            "code": "health_browser_capture_degraded",
+            "message": "Browser capture reported channel read errors.",
+            "recommendation": "Restart browser watcher and verify channel tab access before market open.",
+        },
+        {
+            "severity": "critical",
+            "code": "health_browser_health_stale",
+            "message": "Browser capture health is stale.",
+            "recommendation": "Restart browser watcher and verify channel tab access before market open.",
+        },
+        {
+            "severity": "warning",
+            "code": "broker_terminal_not_filled",
+            "message": "Broker order reached a terminal status without a fill.",
+            "recommendation": "Report expired/unfilled orders separately from real positions; consider no-new-entry cutoff near close.",
+        },
+    ]
+    actions = nightly_review.recommended_next_actions(issues)
+    assert actions == [
+        "Report expired/unfilled orders separately from real positions; consider no-new-entry cutoff near close.",
+        "Restart browser watcher and verify channel tab access before market open.",
+    ]
+
+
 def test_nightly_review_writes_markdown_and_summary() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -1248,7 +1820,8 @@ def test_nightly_review_writes_markdown_and_summary() -> None:
                     "recommendation": "Canonicalize dedupe across sources.",
                 }
             ],
-            "daily_pl": {"total_pnl": -25.0},
+            "daily_pl": {"total_pnl": -25.0, "realized_pnl": -30.0, "open_pnl": 5.0},
+            "all_time_pl": {"total_pnl": 125.0, "realized_pnl": 100.0, "open_pnl": 25.0},
             "recommended_next_actions": ["Canonicalize dedupe across sources."],
         }
         json_path, md_path = nightly_review.write_report(report)
@@ -1260,16 +1833,169 @@ def test_nightly_review_writes_markdown_and_summary() -> None:
         message = nightly_review.telegram_summary(report)
         assert "NIGHTLY PIPELINE REVIEW" in message
         assert "Issues: 1 critical" in message
+        assert "All-time P/L: +$125" in message
+        sent_messages: list[str] = []
+        original_sender = steve_trade_bot.send_message_to_configured_chats
+        try:
+            steve_trade_bot.send_message_to_configured_chats = lambda message: (
+                sent_messages.append(message) or ("sent", "", [{"chat_id": "123", "message_id": 1, "status": "sent"}])
+            )
+            first_delivery = nightly_review.send_telegram_report(report)
+            second_delivery = nightly_review.send_telegram_report(report)
+        finally:
+            steve_trade_bot.send_message_to_configured_chats = original_sender
+        assert first_delivery["status"] == "sent"
+        assert second_delivery["status"] == "already_sent"
+        assert len(sent_messages) == 1
+
+
+def test_nightly_review_markdown_interval_na_text() -> None:
+    report = {
+        "event_type": "nightly_pipeline_review",
+        "day": "2026-05-26",
+        "generated_at": "2026-05-26T17:30:00-04:00",
+        "truth_events": [],
+        "counts": {"truth_buys": 0, "truth_exits": 0, "truth_adds": 0, "truth_context_stops": 0, "matched_buys": 0, "paper_entries": 0, "broker_filled_buys": 0},
+        "issue_counts": {"critical": 1},
+        "capture_method_scorecard": {
+            "truth_event_count": 0,
+            "methods": {
+                "browser": {"matched_truth_events": 0, "capture_rate": 0.0, "latency": {"avg_seconds": None}, "raw_records": 0, "duplicate_event_records": 0},
+                "notification": {"matched_truth_events": 0, "capture_rate": 0.0, "latency": {"avg_seconds": None}, "raw_records": 0, "duplicate_event_records": 0},
+                "other": {"matched_truth_events": 0, "capture_rate": 0.0, "latency": {"avg_seconds": None}, "raw_records": 0, "duplicate_event_records": 0},
+            },
+            "cross_source_duplicate_truth_events": 0,
+            "recommendation": {"recommended_primary": "insufficient_data", "reason": "none", "browser_interval_seconds": None},
+        },
+        "issues": [
+            {
+                "severity": "critical",
+                "code": "health_browser_health_stale",
+                "message": "Browser capture health is stale.",
+                "recommendation": "Restart browser watcher before market open.",
+            }
+        ],
+        "daily_pl": {},
+        "recommended_next_actions": ["Restart browser watcher before market open."],
+    }
+    markdown = nightly_review.markdown_report(report)
+    assert "browser interval target: n/a" in markdown
+    assert "browser interval target: Nones" not in markdown
+
+
+def test_nightly_review_broker_reason_classification() -> None:
+    assert nightly_review.classify_broker_reason("client_order_id must be unique") == "duplicate_broker_order"
+    assert nightly_review.classify_broker_reason("options market orders are only allowed during market hours") == "broker_market_closed"
+    assert nightly_review.classify_broker_reason("account not eligible to trade uncovered option contracts") == "broker_position_reconciliation_failed"
+    assert nightly_review.classify_broker_reason("asset \"GS260522C00200000\" not found") == "broker_contract_not_found"
+    assert nightly_review.classify_broker_reason("paper_order_submission_disabled") == "paper_order_disabled"
+    assert nightly_review.broker_issue_recommendation("broker_contract_not_found").startswith("Validate option contract symbol")
+    assert nightly_review.broker_issue_recommendation("broker_market_closed").startswith("Skip option submits outside market hours")
+
+
+def test_option_sell_order_is_blocked_when_market_closed() -> None:
+    original_load_adapter_config = alpaca_options.load_adapter_config
+    original_require_paper_environment = alpaca_options.require_paper_environment
+    original_options_market_open = alpaca_options.options_market_open
+    original_alpaca_request = alpaca_options.alpaca_request
+    try:
+        alpaca_options.load_adapter_config = lambda: ({}, {})
+        alpaca_options.require_paper_environment = lambda config, env_file, require_keys=True: {
+            "base_url": "https://paper-api.alpaca.markets",
+            "key_id": "paper-key",
+            "secret_key": "paper-secret",
+            "submit_enabled": True,
+        }
+        alpaca_options.options_market_open = lambda env: (False, "options_market_closed:next_open=2026-05-29T09:30:00-04:00")
+        alpaca_options.alpaca_request = lambda method, path, env, body=None: (_ for _ in ()).throw(AssertionError("should not submit order when closed"))
+        audit = alpaca_options.submit_option_paper_sell_order(
+            {
+                "position_id": "human-test-closed",
+                "source_dedupe_key": "closed-source",
+                "ticker": "AAPL",
+                "contract_symbol": "AAPL260618C00310000",
+            },
+            1,
+            "stop_loss",
+            "stop-loss-test",
+        )
+        assert audit["status"] == "blocked"
+        assert str(audit.get("reason") or "").startswith("options_market_closed")
+        assert (audit.get("payload") or {}).get("side") == "sell"
+    finally:
+        alpaca_options.load_adapter_config = original_load_adapter_config
+        alpaca_options.require_paper_environment = original_require_paper_environment
+        alpaca_options.options_market_open = original_options_market_open
+        alpaca_options.alpaca_request = original_alpaca_request
+
+
+def test_browser_snapshot_retries_increase_timeout_and_delay() -> None:
+    original_reader = discord_browser_channel_watcher.read_channel_snapshot
+    original_sleep = discord_browser_channel_watcher.time.sleep
+    attempts: list[tuple[int, float]] = []
+    try:
+        def fake_reader(channel_url: str, timeout: int = 15, first_load_delay: float = 4.0) -> dict[str, Any]:
+            attempts.append((timeout, round(first_load_delay, 2)))
+            if len(attempts) < 3:
+                raise RuntimeError("temporary read error")
+            return {"messages": []}
+
+        discord_browser_channel_watcher.read_channel_snapshot = fake_reader
+        discord_browser_channel_watcher.time.sleep = lambda _seconds: None
+        snapshot = discord_browser_channel_watcher.read_channel_snapshot_with_retries(
+            "https://discord.com/channels/1/2",
+            timeout=10,
+            first_load_delay=2.0,
+            retries=2,
+        )
+        assert snapshot == {"messages": []}
+        assert attempts == [(10, 2.0), (15, 2.75), (20, 3.5)]
+    finally:
+        discord_browser_channel_watcher.read_channel_snapshot = original_reader
+        discord_browser_channel_watcher.time.sleep = original_sleep
+
+
+def test_browser_snapshot_timeout_does_not_retry() -> None:
+    original_reader = discord_browser_channel_watcher.read_channel_snapshot
+    original_sleep = discord_browser_channel_watcher.time.sleep
+    attempts: list[tuple[int, float]] = []
+    sleeps: list[int] = []
+    try:
+        def fake_reader(channel_url: str, timeout: int = 15, first_load_delay: float = 4.0) -> dict[str, Any]:
+            attempts.append((timeout, round(first_load_delay, 2)))
+            raise RuntimeError("Chrome AppleScript read timed out")
+
+        discord_browser_channel_watcher.read_channel_snapshot = fake_reader
+        discord_browser_channel_watcher.time.sleep = lambda seconds: sleeps.append(int(seconds))
+        try:
+            discord_browser_channel_watcher.read_channel_snapshot_with_retries(
+                "https://discord.com/channels/1/2",
+                timeout=10,
+                first_load_delay=2.0,
+                retries=2,
+            )
+            raise AssertionError("expected timeout error")
+        except RuntimeError as exc:
+            assert "timed out" in str(exc).lower()
+        assert attempts == [(10, 2.0)]
+        assert sleeps == []
+    finally:
+        discord_browser_channel_watcher.read_channel_snapshot = original_reader
+        discord_browser_channel_watcher.time.sleep = original_sleep
 
 
 def main() -> int:
     test_parser()
     test_validation_and_approval()
     test_non_hedge_auto_paper_buy()
+    test_non_hedge_bad_entry_requires_approval()
+    test_non_hedge_mixed_buy_exit_requires_approval()
+    test_fill_price_caps_excessive_slippage()
     test_exit_plan_contract_allocation()
     test_multi_destination_approval_cards()
     test_close_report_message_and_delivery()
     test_human_exit_rules_and_steve_catch_up()
+    test_steve_alert_pl_summary_uses_steve_prices()
     test_option_exit_reply_matches_shadow_context()
     test_pipeline_processes_close_reply_as_option_exit()
     test_backfill_text_audit_matches_contextual_exits()
@@ -1279,11 +2005,21 @@ def main() -> int:
     test_daily_pl_summary_short_report()
     test_watcher_steve_filters()
     test_live_pipeline_heartbeat()
+    test_option_tracker_skips_junk_and_writes_lean_deduped_snapshots()
     test_browser_channel_watcher_filters_and_backfills()
     test_pipeline_health_pinpoints_stage_failures()
     test_nightly_review_detects_recursive_improvement_issues()
     test_nightly_review_capture_method_scorecard()
+    test_nightly_review_browser_refresh_overrides_stale_health_and_surfaces_current_errors()
+    test_nightly_review_ignores_synthetic_full_pipeline_artifacts()
+    test_nightly_review_compares_steve_local_and_broker_pl()
+    test_nightly_review_recommended_actions_include_health_fallbacks()
     test_nightly_review_writes_markdown_and_summary()
+    test_nightly_review_markdown_interval_na_text()
+    test_nightly_review_broker_reason_classification()
+    test_option_sell_order_is_blocked_when_market_closed()
+    test_browser_snapshot_retries_increase_timeout_and_delay()
+    test_browser_snapshot_timeout_does_not_retry()
     print("Steve options MVP tests passed")
     return 0
 

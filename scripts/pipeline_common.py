@@ -9,7 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 
@@ -125,10 +125,9 @@ def parse_datetime(value: Any, tz_name: str = DEFAULT_TZ) -> dt.datetime | None:
     return None
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
+def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
+        return
     with path.open("r", encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, 1):
             text = line.strip()
@@ -139,7 +138,13 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 raise ValueError(f"Invalid JSONL in {path} at line {line_no}")
             if isinstance(value, dict):
-                rows.append(value)
+                yield value
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for value in iter_jsonl(path):
+        rows.append(value)
     return rows
 
 
@@ -147,6 +152,43 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
     ensure_project_dirs()
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def last_jsonl_row(path: Path) -> dict[str, Any] | None:
+    last: dict[str, Any] | None = None
+    for row in iter_jsonl(path):
+        last = row
+    return last
+
+
+def json_record_signature(record: dict[str, Any], ignore_keys: Iterable[str] = ()) -> str:
+    ignored = set(ignore_keys)
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in sorted(value.items()) if key not in ignored}
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        return value
+
+    return stable_hash([json.dumps(clean(record), sort_keys=True, separators=(",", ":"))])
+
+
+def append_jsonl_if_changed(
+    path: Path,
+    record: dict[str, Any],
+    *,
+    ignore_keys: Iterable[str] = ("recorded_at",),
+    always_append: bool = False,
+) -> bool:
+    if always_append:
+        append_jsonl(path, record)
+        return True
+    previous = last_jsonl_row(path)
+    if previous is None or json_record_signature(previous, ignore_keys) != json_record_signature(record, ignore_keys):
+        append_jsonl(path, record)
+        return True
+    return False
 
 
 def stable_hash(parts: Iterable[Any]) -> str:
@@ -198,6 +240,8 @@ def atomic_touch_jsonl_files() -> None:
         DATA_DIR / "steve_broker_order_reports.jsonl",
         DATA_DIR / "broker_order_status_reports.jsonl",
         DATA_DIR / "daily_pl_reports.jsonl",
+        DATA_DIR / "steve_alert_pl_reports.jsonl",
+        DATA_DIR / "broker_fill_pl_reports.jsonl",
         DATA_DIR / "nightly_review_reports.jsonl",
         DATA_DIR / "human_paper_positions.jsonl",
         DATA_DIR / "human_paper_exits.jsonl",
@@ -208,7 +252,11 @@ def atomic_touch_jsonl_files() -> None:
         DATA_DIR / "discord_browser_health.jsonl",
         DATA_DIR / "pipeline_health_checks.jsonl",
         DATA_DIR / "pipeline_health_alerts.jsonl",
+        DATA_DIR / "data_hygiene_reports.jsonl",
     ]:
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+    state_path = DATA_DIR / "option_tracking_state.json"
+    if not state_path.exists():
+        state_path.write_text('{"event_type":"option_tracking_state","positions":{},"storage_profile":"latest_position_state_v1"}\n', encoding="utf-8")

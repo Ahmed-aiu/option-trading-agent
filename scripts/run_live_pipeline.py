@@ -10,8 +10,9 @@ import time
 
 from notification_watcher import poll_once
 from broker_order_monitor import check_broker_order_statuses_once
+from data_hygiene import HEALTH_HISTORY_IGNORE_KEYS, heartbeat_is_interesting
 from option_validation import send_daily_pl_summary_once, track_open_positions_once
-from pipeline_common import CONFIG_DIR, DATA_DIR, LOG_DIR, append_jsonl, atomic_touch_jsonl_files, load_seen_keys, load_simple_yaml, now_iso, read_jsonl, setup_logging
+from pipeline_common import CONFIG_DIR, DATA_DIR, LOG_DIR, append_jsonl_if_changed, atomic_touch_jsonl_files, load_seen_keys, load_simple_yaml, now_iso, read_jsonl, setup_logging
 from run_pipeline_once import process_raw_notifications
 from steve_trade_bot import poll_once as poll_telegram_approvals
 
@@ -28,10 +29,17 @@ def request_stop(signum: int, frame: object) -> None:
 
 def write_heartbeat(record: dict) -> None:
     HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    history_appended = append_jsonl_if_changed(
+        HEARTBEAT_HISTORY_FILE,
+        record,
+        ignore_keys=HEALTH_HISTORY_IGNORE_KEYS,
+        always_append=heartbeat_is_interesting(record),
+    )
+    record = dict(record)
+    record["history_appended"] = history_appended
     tmp_path = HEARTBEAT_FILE.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     tmp_path.replace(HEARTBEAT_FILE)
-    append_jsonl(HEARTBEAT_HISTORY_FILE, record)
 
 
 def main() -> int:
