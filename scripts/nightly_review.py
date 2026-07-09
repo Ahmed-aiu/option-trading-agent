@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from backfill_steve_text import useful_lines
 from data_hygiene import compact_runtime_ledgers, data_hygiene_scorecard
-from parse_alert import ParseRejected, parse_trade_alert
+from parse_alert import ParseRejected, parse_trade_alert, raw_text_from_record
 from pipeline_common import CONFIG_DIR, DATA_DIR, append_jsonl, load_simple_yaml, now_iso, parse_datetime, read_jsonl, stable_hash
 from run_pipeline_once import normalize_parsed
 
@@ -37,6 +37,7 @@ BROKER_STATUS_FILE = DATA_DIR / "broker_order_status_reports.jsonl"
 STEVE_EXITS_FILE = DATA_DIR / "steve_option_exits.jsonl"
 PIPELINE_HEALTH_FILE = DATA_DIR / "pipeline_health_checks.jsonl"
 DAILY_PL_FILE = DATA_DIR / "daily_pl_reports.jsonl"
+BROWSER_HEALTH_LATEST_FILE = DATA_DIR / "discord_browser_health_latest.json"
 
 PRICE_RE = r"(?:\d+(?:\.\d+)?|\.\d+)"
 ADD_RE = re.compile(r"\b(?P<action>aaded|added|add)\s+(?P<contracts>\d+)\s+(?:@|at)\s*(?P<price>" + PRICE_RE + r")", re.I)
@@ -97,6 +98,16 @@ def row_time(row: dict[str, Any]) -> str:
 
 def rows_for_day(path: Path, day: str, tz_name: str = "America/Detroit") -> list[dict[str, Any]]:
     return [row for row in read_jsonl(path) if date_key(row_time(row), tz_name) == day]
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def synthetic_test_value(value: Any) -> bool:
@@ -325,6 +336,8 @@ def parse_truth_events_from_text(text: str, source: dict[str, Any]) -> list[dict
                 last_entry = parsed
             elif parsed.get("side") == "exit":
                 events.append(truth_event_from_parsed(parsed, source, "exit"))
+    if any(event.get("kind") in {"add", "exit", "context_stop"} for event in events):
+        events = [event for event in events if event.get("kind") != "buy"]
     return events
 
 
@@ -409,6 +422,114 @@ def dedupe_truth_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def parsed_buy_key(row: dict[str, Any]) -> str:
     return "|".join(["buy", contract_key(row), price_key(row.get("entry_price")), str(row.get("contracts") or "")])
+
+
+def position_duplicate_key(row: dict[str, Any]) -> str:
+    entry_price = row.get("entry_price")
+    if entry_price in (None, ""):
+        entry_price = row.get("alert_entry_price")
+    return "|".join(["buy", contract_key(row), price_key(entry_price), str(row.get("contracts") or "")])
+
+
+def steve_exit_duplicate_key(row: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            "exit",
+            str(row.get("matched_shadow_position_id") or ""),
+            contract_key(row),
+            price_key(row.get("exit_price")),
+            str(row.get("contracts") or ""),
+        ]
+    )
+
+
+def canonical_or_fallback_key(
+    row: dict[str, Any],
+    *,
+    canonical_keys: tuple[str, ...],
+    fallback_key_func: Any,
+) -> tuple[str, str]:
+    for key_name in canonical_keys:
+        value = str(row.get(key_name) or "")
+        if value:
+            return "canonical", value
+    fallback = str(fallback_key_func(row) or "")
+    return ("legacy", fallback) if fallback else ("", "")
+
+
+def duplicate_group_summary(rows: list[dict[str, Any]], key_func: Any, id_key: str) -> dict[str, Any]:
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        key = key_func(row)
+        if not key or key.count("|") and not key.replace("|", ""):
+            continue
+        groups[key].append(row)
+    duplicates = {key: grouped for key, grouped in groups.items() if len(grouped) > 1}
+    examples = []
+    for key, grouped in sorted(duplicates.items(), key=lambda item: len(item[1]), reverse=True)[:10]:
+        examples.append(
+            {
+                "key": key,
+                "count": len(grouped),
+                "ids": [row.get(id_key) for row in grouped[:8]],
+                "source_dedupe_keys": [row.get("source_dedupe_key") for row in grouped[:8]],
+            }
+        )
+    return {
+        "rows": len(rows),
+        "duplicate_groups": len(duplicates),
+        "duplicate_rows": sum(len(grouped) - 1 for grouped in duplicates.values()),
+        "examples": examples,
+    }
+
+
+def build_ledger_duplicate_scorecard(
+    rows: list[dict[str, Any]],
+    *,
+    fallback_key_func: Any,
+    id_key: str,
+    canonical_keys: tuple[str, ...],
+) -> dict[str, Any]:
+    canonical_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    legacy_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        bucket, key = canonical_or_fallback_key(
+            row,
+            canonical_keys=canonical_keys,
+            fallback_key_func=fallback_key_func,
+        )
+        if not bucket or not key:
+            continue
+        target = canonical_groups if bucket == "canonical" else legacy_groups
+        target[key].append(row)
+
+    def summarize(groups: dict[str, list[dict[str, Any]]], limit: int = 10) -> tuple[int, int, list[dict[str, Any]]]:
+        duplicates = {key: grouped for key, grouped in groups.items() if len(grouped) > 1}
+        examples: list[dict[str, Any]] = []
+        for key, grouped in sorted(duplicates.items(), key=lambda item: len(item[1]), reverse=True)[:limit]:
+            examples.append(
+                {
+                    "key": key,
+                    "count": len(grouped),
+                    "ids": [row.get(id_key) for row in grouped[:8]],
+                    "source_dedupe_keys": [row.get("source_dedupe_key") for row in grouped[:8]],
+                }
+            )
+        return len(duplicates), sum(len(grouped) - 1 for grouped in duplicates.values()), examples
+
+    canonical_groups_count, canonical_duplicate_rows, canonical_examples = summarize(canonical_groups)
+    legacy_groups_count, legacy_duplicate_rows, legacy_examples = summarize(legacy_groups)
+    return {
+        "rows": len(rows),
+        "canonical_rows": sum(1 for row in rows if any(str(row.get(key) or "") for key in canonical_keys)),
+        "legacy_rows": sum(1 for row in rows if not any(str(row.get(key) or "") for key in canonical_keys)),
+        "duplicate_groups": canonical_groups_count,
+        "duplicate_rows": canonical_duplicate_rows,
+        "examples": canonical_examples,
+        "legacy_collision_groups": legacy_groups_count,
+        "legacy_collision_rows": legacy_duplicate_rows,
+        "legacy_examples": legacy_examples,
+    }
 
 
 def parsed_exit_key(row: dict[str, Any]) -> str:
@@ -579,6 +700,73 @@ def group_by_key(rows: list[dict[str, Any]], key_func) -> dict[str, list[dict[st
     return grouped
 
 
+def parsed_source_keys(rows: list[dict[str, Any]]) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = str(row.get("source_dedupe_key") or "")
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    return keys
+
+
+def truth_buy_pipeline_evidence(
+    event: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    rejected_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    buy_key = event_key(event)
+    raw_matches: list[dict[str, Any]] = []
+    rejected_matches: list[dict[str, Any]] = []
+    for raw in raw_rows:
+        for parsed in parsed_for_body(
+            str(raw.get("raw_text") or raw_text_from_record(raw)),
+            str(raw.get("notification_timestamp") or raw.get("captured_at") or ""),
+            str((raw.get("raw") or {}).get("source") or raw.get("subtitle") or raw.get("source_app") or ""),
+        ):
+            if str(parsed.get("side") or "") != "buy":
+                continue
+            if parsed_buy_key(parsed) == buy_key:
+                raw_matches.append(raw)
+                break
+    raw_keys = {
+        str(row.get("dedupe_key") or row.get("source_dedupe_key") or "")
+        for row in raw_matches
+        if row.get("dedupe_key") or row.get("source_dedupe_key")
+    }
+    for rejected in rejected_rows:
+        key = str(rejected.get("source_dedupe_key") or "")
+        if key and key in raw_keys:
+            rejected_matches.append(rejected)
+    return {
+        "raw_matches": raw_matches,
+        "rejected_matches": rejected_matches,
+        "raw_match_count": len(raw_matches),
+        "rejected_match_count": len(rejected_matches),
+    }
+
+
+def alert_source_key(row: dict[str, Any]) -> str:
+    alert = row.get("alert")
+    if isinstance(alert, dict) and alert.get("source_dedupe_key"):
+        return str(alert.get("source_dedupe_key"))
+    return str(row.get("source_dedupe_key") or "")
+
+
+def unique_rows_by_key(rows: list[dict[str, Any]], key_name: str) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for row in rows:
+        key = str(row.get(key_name) or "")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        unique.append(row)
+    return unique
+
+
 def issue(severity: str, code: str, message: str, evidence: dict[str, Any], recommendation: str) -> dict[str, Any]:
     return {
         "severity": severity,
@@ -586,6 +774,23 @@ def issue(severity: str, code: str, message: str, evidence: dict[str, Any], reco
         "message": message,
         "evidence": evidence,
         "recommendation": recommendation,
+    }
+
+
+def browser_foreground_recovery_evidence(latest_health: dict[str, Any]) -> dict[str, Any] | None:
+    if not latest_health:
+        return None
+    errors = latest_health.get("errors") or []
+    timeout_errors = [row for row in errors if "timed out" in str(row.get("reason") or "").lower()]
+    if len(timeout_errors) < 2:
+        return None
+    return {
+        "recorded_at": latest_health.get("recorded_at"),
+        "status": latest_health.get("status"),
+        "timeout_count": len(timeout_errors),
+        "channel_count": len(latest_health.get("channels") or []),
+        "timeout_channels": [row.get("channel_id") for row in timeout_errors],
+        "errors": timeout_errors,
     }
 
 
@@ -705,6 +910,82 @@ def summarize_broker_fill_pl(day: str, broker_reports: list[dict[str, Any]], all
     }
 
 
+def broker_fill_notional(row: dict[str, Any]) -> float | None:
+    price = broker_fill_price(row)
+    qty = broker_fill_qty(row)
+    if price is None or qty <= 0:
+        return None
+    return price * qty * 100
+
+
+def broker_fill_activity_summary(
+    day: str,
+    broker_reports: list[dict[str, Any]],
+    all_broker_reports: list[dict[str, Any]],
+    tz_name: str = "America/Detroit",
+) -> dict[str, Any]:
+    filled_reports = [row for row in broker_reports if str(row.get("broker_status") or "").lower() == "filled"]
+    day_fills = [
+        row
+        for row in filled_reports
+        if date_key(row.get("filled_at") or broker_report_time(row), tz_name) == day
+    ]
+    buy_fills = [row for row in day_fills if str(row.get("side") or "").lower() == "buy"]
+    sell_fills = [row for row in day_fills if str(row.get("side") or "").lower() == "sell"]
+
+    all_entry_fills: dict[str, dict[str, Any]] = {}
+    for row in sorted(all_broker_reports, key=broker_report_time):
+        if str(row.get("broker_status") or "").lower() != "filled" or str(row.get("side") or "").lower() != "buy":
+            continue
+        position_id = str(row.get("position_id") or "")
+        if position_id and position_id not in all_entry_fills:
+            all_entry_fills[position_id] = row
+
+    invested = sum(broker_fill_notional(row) or 0.0 for row in buy_fills)
+    proceeds = sum(broker_fill_notional(row) or 0.0 for row in sell_fills)
+    realized_pnl = 0.0
+    realized_rows: list[dict[str, Any]] = []
+    for sell in sell_fills:
+        entry = all_entry_fills.get(str(sell.get("position_id") or ""))
+        entry_price = broker_fill_price(entry or {})
+        exit_price = broker_fill_price(sell)
+        qty = broker_fill_qty(sell)
+        pnl_dollars = None
+        pnl_pct = None
+        if entry_price is not None and exit_price is not None and qty > 0:
+            pnl_dollars = (exit_price - entry_price) * qty * 100
+            realized_pnl += pnl_dollars
+            if entry_price > 0:
+                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+        realized_rows.append(
+            {
+                "label": sell.get("label") or sell.get("contract_symbol") or "OPTION",
+                "qty": qty,
+                "pnl_dollars": pnl_dollars,
+                "pnl_pct": pnl_pct,
+            }
+        )
+    ranked = [row for row in realized_rows if row.get("pnl_dollars") is not None]
+    ranked.sort(key=lambda row: float(row.get("pnl_dollars") or 0))
+    terminal_not_filled = [
+        row
+        for row in broker_reports
+        if str(row.get("broker_status") or "").lower() in {"expired", "rejected", "failed", "canceled"}
+    ]
+    return {
+        "filled_buys": len(buy_fills),
+        "filled_sells": len(sell_fills),
+        "contracts_bought": sum(broker_fill_qty(row) for row in buy_fills),
+        "contracts_sold": sum(broker_fill_qty(row) for row in sell_fills),
+        "invested": invested,
+        "proceeds": proceeds,
+        "realized_pnl": realized_pnl,
+        "best": ranked[-1] if ranked else {},
+        "worst": ranked[0] if ranked else {},
+        "unfilled_terminal": len(terminal_not_filled),
+    }
+
+
 def order_payload_side(row: dict[str, Any]) -> str:
     return str((row.get("payload") or {}).get("side") or row.get("side") or "").lower()
 
@@ -778,6 +1059,11 @@ def recursive_improvement_plan(issues: list[dict[str, Any]], report: dict[str, A
         "broker_market_closed",
         "truth_buy_not_parsed",
         "truth_exit_not_recorded",
+        "duplicate_shadow_position_all_time",
+        "duplicate_paper_position_all_time",
+        "duplicate_steve_exit_all_time",
+        "browser_foreground_recovery_needed",
+        "duplicate_paper_position",
         "broker_terminal_not_filled",
         "ledger_repeated_health_history",
         "ledger_storage_hygiene",
@@ -855,10 +1141,15 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
     raw_rows = [row for row in raw_rows if not is_synthetic_test_row(row)]
     rejected = [row for row in rejected if not is_synthetic_test_row(row)]
     approval_cards = [row for row in approval_cards if not is_synthetic_test_row(row)]
+    auto_buy_reports = rows_for_day(AUTO_BUY_REPORTS_FILE, day, tz_name)
+    filtered_counts["auto_buy_reports"] = sum(1 for row in auto_buy_reports if is_synthetic_test_row(row))
+    auto_buy_reports = [row for row in auto_buy_reports if not is_synthetic_test_row(row)]
     health_checks = rows_for_day(PIPELINE_HEALTH_FILE, day, tz_name)
     capture_scorecard = capture_method_scorecard(truth_events, raw_rows, tz_name)
 
     buys_by_key = group_by_key(parsed_buys, parsed_buy_key)
+    approval_cards_by_source = group_by_key(approval_cards, alert_source_key)
+    auto_buy_reports_by_source = group_by_key(auto_buy_reports, alert_source_key)
     exits_by_contract = group_by_key(parsed_exits, contract_key)
     steve_exits_by_contract = group_by_key(steve_exits, contract_key)
     positions_by_contract = group_by_key(positions, contract_key)
@@ -872,11 +1163,34 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
     from option_validation import SHADOW_POSITIONS_FILE, compute_steve_alert_pl_summary
 
     all_shadow_positions = [row for row in read_jsonl(SHADOW_POSITIONS_FILE) if not is_synthetic_test_row(row)]
+    all_human_positions = [row for row in read_jsonl(HUMAN_POSITIONS_FILE) if not is_synthetic_test_row(row)]
     all_steve_exits = [row for row in read_jsonl(STEVE_EXITS_FILE) if not is_synthetic_test_row(row)]
+    ledger_duplicate_scorecard = {
+        "shadow_positions": build_ledger_duplicate_scorecard(
+            all_shadow_positions,
+            fallback_key_func=position_duplicate_key,
+            id_key="position_id",
+            canonical_keys=("canonical_entry_key",),
+        ),
+        "human_positions": build_ledger_duplicate_scorecard(
+            all_human_positions,
+            fallback_key_func=position_duplicate_key,
+            id_key="position_id",
+            canonical_keys=("canonical_entry_key",),
+        ),
+        "steve_exits": build_ledger_duplicate_scorecard(
+            all_steve_exits,
+            fallback_key_func=steve_exit_duplicate_key,
+            id_key="exit_id",
+            canonical_keys=("canonical_exit_key", "canonical_raw_exit_key"),
+        ),
+    }
     steve_alert_pl = compute_steve_alert_pl_summary(day, positions=all_shadow_positions, exits=all_steve_exits, snapshots=[])
     all_time_steve_alert_pl = compute_steve_alert_pl_summary(day, all_time=True, positions=all_shadow_positions, exits=all_steve_exits, snapshots=[])
     broker_fill_pl = summarize_broker_fill_pl(day, broker_reports, tz_name=tz_name)
-    all_time_broker_fill_pl = summarize_broker_fill_pl(day, [row for row in read_jsonl(BROKER_STATUS_FILE) if not is_synthetic_test_row(row)], all_time=True, tz_name=tz_name)
+    all_broker_status_reports = [row for row in read_jsonl(BROKER_STATUS_FILE) if not is_synthetic_test_row(row)]
+    all_time_broker_fill_pl = summarize_broker_fill_pl(day, all_broker_status_reports, all_time=True, tz_name=tz_name)
+    executive_activity = broker_fill_activity_summary(day, broker_reports, all_broker_status_reports, tz_name=tz_name)
 
     truth_buys = [event for event in truth_events if event.get("kind") == "buy"]
     truth_exits = [event for event in truth_events if event.get("kind") == "exit"]
@@ -889,26 +1203,111 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
         if parsed_matches:
             matched_buys += 1
         else:
+            pipeline_evidence = truth_buy_pipeline_evidence(event, raw_rows, rejected)
+            if pipeline_evidence["raw_matches"]:
+                issues.append(
+                    issue(
+                        "critical",
+                        "truth_buy_not_parsed",
+                        "Steve buy alert exists in Discord truth and in raw capture, but no matching parsed buy exists.",
+                        {"event": event, **pipeline_evidence},
+                        "Fix parser or raw-to-parsed normalization so this captured Steve buy reaches parsed_alerts before next session.",
+                    )
+                )
+            else:
+                issues.append(
+                    issue(
+                        "critical",
+                        "truth_buy_not_captured",
+                        "Steve buy alert exists in Discord truth but never reached raw_notifications.",
+                        {"event": event, **pipeline_evidence},
+                        "Fix browser/notification capture reliability before market open; this miss happened before parser routing.",
+                    )
+                )
+            continue
+        contract_positions = positions_by_contract.get(event["contract_key"], [])
+        parsed_keys = parsed_source_keys(parsed_matches)
+        related_cards = unique_rows_by_key(
+            [row for key in parsed_keys for row in approval_cards_by_source.get(key, [])],
+            "approval_id",
+        )
+        related_auto_buys = unique_rows_by_key(
+            [row for key in parsed_keys for row in auto_buy_reports_by_source.get(key, [])],
+            "auto_paper_id",
+        )
+        if contract_positions:
+            paper_entries += 1
+        elif related_auto_buys and any(
+            str(row.get("broker_status") or "").lower() in {"submitted", "filled"} for row in related_auto_buys
+        ):
             issues.append(
                 issue(
                     "critical",
-                    "truth_buy_not_parsed",
-                    "Steve buy alert exists in Discord truth but no matching parsed buy exists.",
-                    {"event": event},
-                    "Fix parser/canonical dedupe so this Steve buy enters parsed_alerts before next session.",
+                    "auto_buy_missing_local_position",
+                    "Auto paper buy was accepted by the broker path for a parsed Steve buy, but no local paper position was recorded.",
+                    {
+                        "event": event,
+                        "parsed_keys": parsed_keys,
+                        "auto_buy_ids": [row.get("auto_paper_id") for row in related_auto_buys],
+                        "broker_statuses": [row.get("broker_status") for row in related_auto_buys],
+                    },
+                    "Keep auto-buy and local position creation atomic so paper entries never disappear after broker submission.",
                 )
             )
-            continue
-        contract_positions = positions_by_contract.get(event["contract_key"], [])
-        if contract_positions:
-            paper_entries += 1
+        elif related_auto_buys:
+            pass
+        elif related_cards:
+            latest_card = max(related_cards, key=row_time)
+            alert_payload = latest_card.get("alert") if isinstance(latest_card.get("alert"), dict) else {}
+            guard = alert_payload.get("auto_entry_guard") if isinstance(alert_payload, dict) else {}
+            approval_status = str(latest_card.get("status") or "")
+            if guard:
+                delivery_failed = approval_status in {"telegram_disabled", "send_failed"}
+                issues.append(
+                    issue(
+                        "critical" if delivery_failed else "warning",
+                        "parsed_buy_held_by_auto_entry_guard",
+                        "Parsed Steve buy was held by the auto-entry guard and routed to Telegram approval instead of immediate paper entry.",
+                        {
+                            "event": event,
+                            "parsed_keys": parsed_keys,
+                            "approval_id": latest_card.get("approval_id"),
+                            "approval_status": approval_status or "unknown",
+                            "guard": guard,
+                        },
+                        (
+                            "Fix Telegram approval delivery before market open so guarded buys are still actionable."
+                            if delivery_failed
+                            else "Keep the guard explicit in nightly output; only loosen slippage or quote-age thresholds after comparing missed fills against bad chases."
+                        ),
+                    )
+                )
+            else:
+                issues.append(
+                    issue(
+                        "critical" if approval_status in {"telegram_disabled", "send_failed"} else "warning",
+                        "parsed_buy_waiting_on_approval",
+                        "Parsed Steve buy was routed to Telegram approval instead of immediate paper entry.",
+                        {
+                            "event": event,
+                            "parsed_keys": parsed_keys,
+                            "approval_id": latest_card.get("approval_id"),
+                            "approval_status": approval_status or "unknown",
+                        },
+                        (
+                            "Restore Telegram approval delivery before market open."
+                            if approval_status in {"telegram_disabled", "send_failed"}
+                            else "Review whether this approval path is still justified for unambiguous Steve buys."
+                        ),
+                    )
+                )
         else:
             issues.append(
                 issue(
                     "critical",
                     "parsed_buy_not_paper_traded",
                     "Parsed Steve buy did not create a local paper position.",
-                    {"event": event, "parsed_keys": [row.get("source_dedupe_key") for row in parsed_matches]},
+                    {"event": event, "parsed_keys": parsed_keys},
                     "Route every non-ambiguous Steve option buy to immediate paper entry; only ask Telegram for genuinely ambiguous context.",
                 )
             )
@@ -1007,6 +1406,48 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
                 )
             )
 
+    for label, code, message, recommendation in (
+        (
+            "shadow_positions",
+            "duplicate_shadow_position_all_time",
+            "All-time shadow ledger contains duplicate Steve buy groups.",
+            "Confirm canonical entry keys stopped growing duplicate shadow rows after the latest dedupe change.",
+        ),
+        (
+            "human_positions",
+            "duplicate_paper_position_all_time",
+            "All-time human paper ledger contains duplicate Steve buy groups.",
+            "Confirm canonical entry keys stopped growing duplicate human paper rows after the latest dedupe change.",
+        ),
+        (
+            "steve_exits",
+            "duplicate_steve_exit_all_time",
+            "All-time Steve close ledger contains duplicate close groups.",
+            "Confirm canonical close keys stopped growing duplicate close rows and cumulative exits count unique close events only.",
+        ),
+    ):
+        stats = ledger_duplicate_scorecard.get(label) or {}
+        if int(stats.get("duplicate_groups") or 0) > 0:
+            issues.append(
+                issue(
+                    "critical" if label == "human_positions" else "warning",
+                    code,
+                    message,
+                    {label: stats},
+                    recommendation,
+                )
+            )
+        elif int(stats.get("legacy_collision_groups") or 0) > 0:
+            issues.append(
+                issue(
+                    "warning",
+                    f"legacy_{code}",
+                    message.replace("contains duplicate", "contains pre-canonical coarse-key collisions for"),
+                    {label: stats},
+                    "Treat these as historical cleanup candidates; only escalate again if canonical-key duplicates reappear.",
+                )
+            )
+
     for order in orders:
         reason = str(order.get("reason") or "")
         if order.get("status") == "blocked" or reason:
@@ -1079,12 +1520,14 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
 
     browser_refresh_errors = [item for item in browser_refresh if str(item.get("status") or "") == "error"]
     refresh_browser_healthy = refresh_browser and bool(browser_refresh) and not browser_refresh_errors
+    latest_browser_health = load_json(BROWSER_HEALTH_LATEST_FILE)
+    foreground_recovery = browser_foreground_recovery_evidence(latest_browser_health)
     seen_health_issue_keys: set[str] = set()
     for check in health_checks:
         if check.get("status") != "ok":
             for item in check.get("issues") or []:
                 issue_code = str(item.get("code") or "")
-                if refresh_browser_healthy and issue_code in {"browser_health_stale", "browser_capture_degraded"}:
+                if refresh_browser_healthy and not foreground_recovery and issue_code in {"browser_health_stale", "browser_capture_degraded"}:
                     # Nightly browser refresh succeeded; suppress stale browser-health alarms from earlier checks.
                     continue
                 health_key = f"{item.get('stage')}:{item.get('code')}"
@@ -1108,6 +1551,19 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
                 "Nightly browser refresh could not read one or more configured Discord channels.",
                 {"errors": browser_refresh_errors},
                 "Recover the stuck Discord tabs/Chrome session and rerun browser watcher before market open.",
+            )
+        )
+    elif foreground_recovery:
+        issues.append(
+            issue(
+                "critical",
+                "browser_foreground_recovery_needed",
+                "Live browser watcher still shows repeated Chrome AppleScript timeouts across channels.",
+                {
+                    "latest_browser_health": foreground_recovery,
+                    "nightly_browser_refresh_ok": refresh_browser_healthy,
+                },
+                "Restart browser capture with `scripts/run_browser_watcher_foreground.sh` before market open and verify Chrome channel reads in the foreground.",
             )
         )
 
@@ -1148,12 +1604,14 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
         "issue_counts": dict(severities),
         "issues": issues,
         "capture_method_scorecard": capture_scorecard,
+        "ledger_duplicate_scorecard": ledger_duplicate_scorecard,
         "daily_pl": summarize_daily_pl(day),
         "all_time_pl": summarize_all_time_pl(),
         "steve_alert_pl": steve_alert_pl,
         "all_time_steve_alert_pl": all_time_steve_alert_pl,
         "broker_fill_pl": broker_fill_pl,
         "all_time_broker_fill_pl": all_time_broker_fill_pl,
+        "executive_activity": executive_activity,
         "storage_hygiene": storage_hygiene,
         "recursive_improvement_plan": [],
         "recommended_next_actions": recommended_next_actions(issues),
@@ -1165,6 +1623,10 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
 def recommended_next_actions(issues: list[dict[str, Any]]) -> list[str]:
     ordered_codes = [
         "duplicate_paper_position",
+        "duplicate_paper_position_all_time",
+        "duplicate_shadow_position_all_time",
+        "duplicate_steve_exit_all_time",
+        "browser_foreground_recovery_needed",
         "scale_in_not_supported",
         "contextual_stop_not_executed",
         "truth_buy_not_parsed",
@@ -1209,6 +1671,84 @@ def format_money(value: Any) -> str:
         return "n/a"
     sign = "+" if number >= 0 else "-"
     return f"{sign}${abs(number):,.0f}"
+
+
+def format_amount(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "n/a"
+    return f"${number:,.0f}"
+
+
+def format_pct(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "n/a"
+    return f"{number:+.1f}%"
+
+
+def executive_trade_line(label: str, row: dict[str, Any]) -> str:
+    if not row:
+        return f"{label}: n/a"
+    return (
+        f"{label}: {row.get('label') or 'OPTION'} "
+        f"{format_money(row.get('pnl_dollars'))} / {format_pct(row.get('pnl_pct'))}"
+    )
+
+
+def executive_loop_line(report: dict[str, Any]) -> list[str]:
+    issues = report.get("issues") or []
+    plan = report.get("recursive_improvement_plan") or []
+    top_issue = issues[0] if issues else {}
+    found = top_issue.get("code") or "no critical issues"
+    fixed_items = [item for item in plan if str(item.get("status") or "").lower() in {"fixed", "complete", "validated"}]
+    fixed = fixed_items[0].get("code") if fixed_items else ("no changes needed" if not issues else "none auto-applied")
+    actions = report.get("recommended_next_actions") or []
+    next_action = str(actions[0])[:90] if actions else "monitor tomorrow's capture and fills"
+    return [
+        "Improvement loop:",
+        f"Found: {found}",
+        f"Fixed: {fixed}",
+        f"Next: {next_action}",
+    ]
+
+
+def executive_telegram_summary(report: dict[str, Any]) -> str:
+    activity = report.get("executive_activity") or {}
+    capture = report.get("capture_method_scorecard") or {}
+    methods = capture.get("methods") or {}
+    browser_capture = methods.get("browser") or {}
+    recommendation = capture.get("recommendation") or {}
+    day = str(report.get("day") or "")
+    try:
+        day_label = dt.date.fromisoformat(day).strftime("%b %d")
+    except ValueError:
+        day_label = day or "today"
+    lines = [
+        f"DAILY PAPER SUMMARY - {day_label}",
+        (
+            f"Filled buys: {activity.get('filled_buys', 0)} "
+            f"({activity.get('contracts_bought', 0)} contracts) | "
+            f"Filled sells: {activity.get('filled_sells', 0)} "
+            f"({activity.get('contracts_sold', 0)} contracts)"
+        ),
+        (
+            f"Invested: {format_amount(activity.get('invested'))} | "
+            f"Proceeds: {format_amount(activity.get('proceeds'))}"
+        ),
+        f"Realized P/L: {format_money(activity.get('realized_pnl'))}",
+        executive_trade_line("Best", activity.get("best") or {}),
+        executive_trade_line("Worst", activity.get("worst") or {}),
+        f"Unfilled/expired: {activity.get('unfilled_terminal', 0)}",
+    ]
+    if capture:
+        lines.append(
+            "Capture: "
+            f"browser {browser_capture.get('matched_truth_events', 0)}/{capture.get('truth_event_count', 0)} | "
+            f"best {recommendation.get('recommended_primary') or 'n/a'}"
+        )
+    lines.extend(executive_loop_line(report))
+    return "\n".join(lines)
 
 
 def telegram_summary(report: dict[str, Any]) -> str:
@@ -1331,6 +1871,17 @@ def markdown_report(report: dict[str, Any]) -> str:
         )
     else:
         lines.append("- No capture scorecard available.")
+    duplicate_scorecard = report.get("ledger_duplicate_scorecard") or {}
+    if duplicate_scorecard:
+        lines.extend(["", "## Ledger Duplicate Scorecard", ""])
+        for label in ("shadow_positions", "human_positions", "steve_exits"):
+            stats = duplicate_scorecard.get(label) or {}
+            lines.append(
+                f"- {label}: groups={stats.get('duplicate_groups', 0)} "
+                f"extra_rows={stats.get('duplicate_rows', 0)} rows={stats.get('rows', 0)} "
+                f"legacy_groups={stats.get('legacy_collision_groups', 0)} "
+                f"legacy_extra_rows={stats.get('legacy_collision_rows', 0)}"
+            )
     lines.extend(["", "## Issues", ""])
     if not report.get("issues"):
         lines.append("- No issues detected.")
@@ -1372,6 +1923,7 @@ def write_report(report: dict[str, Any]) -> tuple[Path, Path]:
             "all_time_pl": report.get("all_time_pl"),
             "steve_alert_pl": report.get("steve_alert_pl"),
             "broker_fill_pl": report.get("broker_fill_pl"),
+            "executive_activity": report.get("executive_activity"),
             "storage_hygiene": report.get("storage_hygiene"),
             "recursive_improvement_plan": report.get("recursive_improvement_plan"),
             "recommended_next_actions": report.get("recommended_next_actions"),
@@ -1396,13 +1948,20 @@ def nightly_telegram_already_sent(day: str) -> bool:
 
 
 def send_telegram_report(report: dict[str, Any], force: bool = False) -> dict[str, Any]:
-    from steve_trade_bot import send_message_to_configured_chats
+    from steve_trade_bot import delivery_status_from_messages, send_message_to_approval_chats, send_message_to_executive_chats
 
     day = str(report.get("day") or "")
     if day and not force and nightly_telegram_already_sent(day):
         return {"status": "already_sent", "reason": "nightly_review_already_sent_for_day", "telegram_messages": []}
     message = telegram_summary(report)
-    status, reason, messages = send_message_to_configured_chats(message)
+    status, reason, messages = send_message_to_approval_chats(message)
+    executive_message = executive_telegram_summary(report)
+    executive_status, executive_reason, executive_messages = send_message_to_executive_chats(executive_message)
+    if executive_messages:
+        messages.extend(executive_messages)
+        status, reason = delivery_status_from_messages(messages)
+    elif status != "sent" and executive_reason:
+        reason = "; ".join(part for part in [reason, executive_reason] if part)
     delivery = {
         "event_type": "nightly_telegram_report",
         "day": day,
@@ -1410,6 +1969,8 @@ def send_telegram_report(report: dict[str, Any], force: bool = False) -> dict[st
         "status": status,
         "reason": reason,
         "message_text": message,
+        "executive_message_text": executive_message,
+        "executive_status": executive_status,
         "telegram_messages": messages,
     }
     append_jsonl(NIGHTLY_TELEGRAM_FILE, delivery)

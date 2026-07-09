@@ -32,4 +32,4 @@ dedupe_window_minutes: 60
 write_all_discord_notifications: false
 timezone: America/Detroit
 capture_method: auto
-browser_watcher_interval_seconds: 5
+browser_watcher_interval_seconds: 3

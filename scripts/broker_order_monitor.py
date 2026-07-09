@@ -156,6 +156,7 @@ def build_status_report(order_audit: dict[str, Any], broker_order: dict[str, Any
         "client_order_id": broker_order.get("client_order_id") or payload.get("client_order_id"),
         "broker_status": broker_order.get("status"),
         "action": order_audit.get("action"),
+        "exit_reason": order_audit.get("exit_reason"),
         "position_id": order_audit.get("position_id"),
         "source_dedupe_key": order_audit.get("source_dedupe_key"),
         "contract_symbol": contract_symbol,

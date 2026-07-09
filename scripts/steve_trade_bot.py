@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from alpaca_options import submit_option_paper_order
-from option_validation import validation_id
+from option_validation import canonical_option_entry_key, validation_id
 from pipeline_common import DATA_DIR, append_jsonl, now_iso, parse_datetime, read_jsonl, stable_hash
 
 
@@ -27,6 +27,9 @@ AUTO_BUY_REPORTS_FILE = DATA_DIR / "steve_auto_buy_reports.jsonl"
 BROKER_ORDER_REPORTS_FILE = DATA_DIR / "steve_broker_order_reports.jsonl"
 DAILY_PL_REPORTS_FILE = DATA_DIR / "daily_pl_reports.jsonl"
 HUMAN_POSITIONS_FILE = DATA_DIR / "human_paper_positions.jsonl"
+PARSED_ALERTS_FILE = DATA_DIR / "parsed_alerts.jsonl"
+RAW_NOTIFICATIONS_FILE = DATA_DIR / "raw_notifications.jsonl"
+BROKER_STATUS_REPORTS_FILE = DATA_DIR / "broker_order_status_reports.jsonl"
 BOT_STATE_FILE = DATA_DIR / "steve_trade_bot_state.json"
 DEFAULT_STOP_PERCENT = 35.0
 DEFAULT_TAKE_PERCENT = 80.0
@@ -57,6 +60,7 @@ class BotConfig:
     owner_chat_id: str
     owner_user_id: str
     approval_chat_ids: tuple[str, ...] = ()
+    executive_chat_ids: tuple[str, ...] = ()
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -108,17 +112,29 @@ def load_bot_config(required: bool = False) -> BotConfig | None:
         [primary_approval_chat_id]
         + split_approval_chat_ids(env_value("STEVE_TRADE_APPROVAL_CHAT_IDS", env_file))
     )
+    owner_chat_id = normalize_approval_chat_id(env_value("STEVE_TRADE_OWNER_CHAT_ID", env_file) or legacy_approver_chat_id)
+    if not owner_chat_id and primary_approval_chat_id and not primary_approval_chat_id.startswith("-"):
+        owner_chat_id = primary_approval_chat_id
+    approval_dm_chat_ids = dedupe_chat_ids([owner_chat_id])
+    executive_chat_ids = dedupe_chat_ids(
+        split_approval_chat_ids(env_value("STEVE_TRADE_EXECUTIVE_CHAT_ID", env_file))
+        + split_approval_chat_ids(env_value("STEVE_TRADE_EXECUTIVE_CHAT_IDS", env_file))
+    )
+    if not executive_chat_ids:
+        executive_chat_ids = dedupe_chat_ids(
+            [chat_id for chat_id in approval_chat_ids if chat_id and chat_id not in set(approval_dm_chat_ids)]
+        )
     config = BotConfig(
         token=env_value("STEVE_TRADE_BOT_TOKEN", env_file),
-        approval_chat_id=approval_chat_ids[0] if approval_chat_ids else "",
-        owner_chat_id=env_value("STEVE_TRADE_OWNER_CHAT_ID", env_file) or legacy_approver_chat_id,
+        approval_chat_id=approval_dm_chat_ids[0] if approval_dm_chat_ids else "",
+        owner_chat_id=owner_chat_id,
         owner_user_id=env_value("STEVE_TRADE_OWNER_USER_ID", env_file) or legacy_approver_user_id,
-        approval_chat_ids=approval_chat_ids,
+        approval_chat_ids=approval_dm_chat_ids,
+        executive_chat_ids=executive_chat_ids,
     )
     if required and (not config.token or not config.approval_chat_ids or not config.owner_chat_id or not config.owner_user_id):
         raise RuntimeError(
-            "Missing STEVE_TRADE_BOT_TOKEN, STEVE_TRADE_APPROVAL_CHAT_ID or STEVE_TRADE_APPROVAL_CHAT_IDS, "
-            "STEVE_TRADE_OWNER_CHAT_ID, or STEVE_TRADE_OWNER_USER_ID"
+            "Missing STEVE_TRADE_BOT_TOKEN, STEVE_TRADE_OWNER_CHAT_ID, or STEVE_TRADE_OWNER_USER_ID"
         )
     if not config.token or not config.approval_chat_ids or not config.owner_chat_id or not config.owner_user_id:
         return None
@@ -146,19 +162,36 @@ def telegram_request(token: str, method: str, payload: dict[str, Any]) -> dict[s
 
 
 def configured_approval_chat_ids(config: BotConfig) -> tuple[str, ...]:
+    if config.owner_chat_id:
+        return dedupe_chat_ids([str(config.owner_chat_id)])
     return config.approval_chat_ids or ((str(config.approval_chat_id),) if config.approval_chat_id else ())
+
+
+def configured_executive_chat_ids(config: BotConfig) -> tuple[str, ...]:
+    approval_ids = set(configured_approval_chat_ids(config))
+    executive_ids = list(config.executive_chat_ids)
+    executive_ids.extend(str(chat_id) for chat_id in config.approval_chat_ids if str(chat_id) not in approval_ids)
+    return dedupe_chat_ids(executive_ids)
 
 
 def send_telegram_message(config: BotConfig, text: str, chat_id: str | None = None) -> dict[str, Any]:
     return telegram_request(config.token, "sendMessage", {"chat_id": chat_id or config.approval_chat_id, "text": text})
 
 
-def send_message_to_configured_chats(message: str) -> tuple[str, str, list[dict[str, Any]]]:
-    config = load_bot_config(required=False)
-    if config is None:
-        return "telegram_disabled", "missing_steve_trade_bot_env", []
+def delivery_status_from_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
+    successes = [row for row in messages if row.get("status") == "sent"]
+    failures = [row for row in messages if row.get("status") != "sent"]
+    reason = "; ".join(f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason"))
+    if successes:
+        return ("partial_sent" if failures else "sent"), reason
+    return "send_failed", reason
+
+
+def send_message_to_chat_ids(config: BotConfig, message: str, chat_ids: tuple[str, ...]) -> tuple[str, str, list[dict[str, Any]]]:
+    if not chat_ids:
+        return "telegram_disabled", "no_configured_chat_ids", []
     messages: list[dict[str, Any]] = []
-    for chat_id in configured_approval_chat_ids(config):
+    for chat_id in chat_ids:
         try:
             response = send_telegram_message(config, message, chat_id=chat_id)
             if not response.get("ok"):
@@ -175,12 +208,26 @@ def send_message_to_configured_chats(message: str) -> tuple[str, str, list[dict[
             )
         except Exception as exc:  # noqa: BLE001
             messages.append({"chat_id": str(chat_id), "message_id": None, "status": "send_failed", "reason": str(exc)})
-    successes = [row for row in messages if row.get("status") == "sent"]
-    failures = [row for row in messages if row.get("status") != "sent"]
-    reason = "; ".join(f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason"))
-    if successes:
-        return ("partial_sent" if failures else "sent"), reason, messages
-    return "send_failed", reason, messages
+    status, reason = delivery_status_from_messages(messages)
+    return status, reason, messages
+
+
+def send_message_to_approval_chats(message: str) -> tuple[str, str, list[dict[str, Any]]]:
+    config = load_bot_config(required=False)
+    if config is None:
+        return "telegram_disabled", "missing_steve_trade_bot_env", []
+    return send_message_to_chat_ids(config, message, configured_approval_chat_ids(config))
+
+
+def send_message_to_executive_chats(message: str) -> tuple[str, str, list[dict[str, Any]]]:
+    config = load_bot_config(required=False)
+    if config is None:
+        return "telegram_disabled", "missing_steve_trade_bot_env", []
+    return send_message_to_chat_ids(config, message, configured_executive_chat_ids(config))
+
+
+def send_message_to_configured_chats(message: str) -> tuple[str, str, list[dict[str, Any]]]:
+    return send_message_to_approval_chats(message)
 
 
 def format_price(value: Any) -> str:
@@ -207,6 +254,57 @@ def format_signed_money(value: Any) -> str:
     if absolute >= 100 or absolute.is_integer():
         return f"{sign}${absolute:,.0f}"
     return f"{sign}${absolute:,.2f}"
+
+
+def safe_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def format_money_amount(value: Any) -> str:
+    amount = safe_float(value)
+    if amount is None:
+        return "n/a"
+    if abs(amount) >= 100 or float(amount).is_integer():
+        return f"${amount:,.0f}"
+    return f"${amount:,.2f}"
+
+
+def format_local_time(value: Any) -> str:
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return "n/a"
+    return f"{parsed:%b} {parsed.day} {parsed:%H:%M:%S ET}"
+
+
+def elapsed_text(start: Any, end: Any) -> str:
+    start_time = parse_datetime(start)
+    end_time = parse_datetime(end)
+    if start_time is None or end_time is None:
+        return "n/a"
+    seconds = int((end_time - start_time).total_seconds())
+    if seconds < 0:
+        return "n/a"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def order_side_word(side: Any) -> str:
@@ -244,6 +342,96 @@ def option_alert_label(alert: dict[str, Any], snapshot: dict[str, Any] | None = 
     return str((snapshot or {}).get("contract_symbol") or ticker or "OPTION")
 
 
+def compact_alert_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def alert_text_from_alert(alert: dict[str, Any]) -> str:
+    return compact_alert_text(alert.get("matched_text") or alert.get("raw_text"))
+
+
+def alert_time_from_alert(alert: dict[str, Any]) -> str:
+    for key in ("notification_timestamp", "captured_at", "opened_at", "parsed_at", "created_at"):
+        if parse_datetime(alert.get(key)) is not None:
+            return str(alert.get(key))
+    return ""
+
+
+def alert_context_from_alert(alert: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "alert_text": alert_text_from_alert(alert),
+        "alert_time": alert_time_from_alert(alert),
+        "alert_price": safe_float(alert.get("entry_price") or alert.get("alert_entry_price")),
+    }
+
+
+def alert_context_for_source(source_dedupe_key: Any, approval_id: Any = None) -> dict[str, Any]:
+    source_key = str(source_dedupe_key or "")
+    approval_key = str(approval_id or "")
+    for card in reversed(read_jsonl(APPROVAL_CARDS_FILE)):
+        alert = card.get("alert") or {}
+        if approval_key and str(card.get("approval_id") or "") == approval_key:
+            context = alert_context_from_alert(alert)
+            if context.get("alert_text"):
+                return context
+        if source_key and str(alert.get("source_dedupe_key") or card.get("source_dedupe_key") or "") == source_key:
+            context = alert_context_from_alert(alert)
+            if context.get("alert_text"):
+                return context
+    for row in reversed(read_jsonl(PARSED_ALERTS_FILE)):
+        if source_key and str(row.get("source_dedupe_key") or "") == source_key:
+            context = alert_context_from_alert(row)
+            if context.get("alert_text"):
+                return context
+    for row in reversed(read_jsonl(RAW_NOTIFICATIONS_FILE)):
+        if source_key and source_key in {str(row.get("source_dedupe_key") or ""), str(row.get("dedupe_key") or "")}:
+            text = compact_alert_text(row.get("body") or row.get("raw_text"))
+            if text:
+                return {
+                    "alert_text": text,
+                    "alert_time": alert_time_from_alert(row),
+                    "alert_price": None,
+                }
+    return {"alert_text": "", "alert_time": "", "alert_price": None}
+
+
+def position_for_id(position_id: Any) -> dict[str, Any]:
+    if not position_id:
+        return {}
+    for position in reversed(read_jsonl(HUMAN_POSITIONS_FILE)):
+        if str(position.get("position_id") or "") == str(position_id):
+            return position
+    return {}
+
+
+def alert_context_for_status_report(status_report: dict[str, Any]) -> dict[str, Any]:
+    source_key = status_report.get("source_dedupe_key")
+    position_id = str(status_report.get("position_id") or "")
+    approval_id = ""
+    position = position_for_id(position_id)
+    if position:
+        approval_id = str(position.get("approval_id") or "")
+        if not source_key:
+            source_key = position.get("source_dedupe_key")
+        context = {
+            "alert_text": compact_alert_text(position.get("alert_text")),
+            "alert_time": str(position.get("alert_time") or ""),
+            "alert_price": safe_float(position.get("alert_price") or position.get("alert_entry_price")),
+        }
+        if context["alert_text"] and context["alert_time"]:
+            return context
+    context = alert_context_for_source(source_key, approval_id)
+    if position:
+        context["alert_text"] = context.get("alert_text") or compact_alert_text(position.get("alert_text"))
+        context["alert_time"] = context.get("alert_time") or str(position.get("alert_time") or position.get("opened_at") or "")
+        context["alert_price"] = context.get("alert_price") if context.get("alert_price") is not None else safe_float(position.get("alert_price"))
+    return context
+
+
+def alert_text_for_status_report(status_report: dict[str, Any]) -> str:
+    return str(alert_context_for_status_report(status_report).get("alert_text") or "")
+
+
 def close_reason_text(exit_record: dict[str, Any]) -> str:
     reason = str(exit_record.get("reason") or "")
     if reason == "take_profit":
@@ -278,51 +466,19 @@ def close_report_message(exit_record: dict[str, Any]) -> str:
 
 
 def send_human_exit_report(exit_record: dict[str, Any]) -> dict[str, Any]:
-    config = load_bot_config(required=False)
     message = close_report_message(exit_record)
+    status, reason, messages = send_message_to_approval_chats(message)
     report = {
         "event_type": "steve_close_report",
         "exit_id": exit_record.get("exit_id"),
         "position_id": exit_record.get("position_id"),
         "approval_id": exit_record.get("approval_id"),
         "created_at": now_iso(),
-        "status": "telegram_disabled",
-        "reason": "missing_steve_trade_bot_env",
+        "status": status,
+        "reason": reason,
         "message_text": message,
-        "telegram_messages": [],
+        "telegram_messages": messages,
     }
-    if config is not None:
-        messages: list[dict[str, Any]] = []
-        for chat_id in configured_approval_chat_ids(config):
-            try:
-                response = send_telegram_message(config, message, chat_id=chat_id)
-                if not response.get("ok"):
-                    raise RuntimeError(f"Telegram returned non-ok response: {response}")
-                result = response.get("result", {})
-                chat = result.get("chat") or {}
-                messages.append(
-                    {
-                        "chat_id": str(chat.get("id") if chat.get("id") is not None else chat_id),
-                        "message_id": result.get("message_id"),
-                        "status": "sent",
-                        "reason": "",
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001
-                messages.append({"chat_id": str(chat_id), "message_id": None, "status": "send_failed", "reason": str(exc)})
-        report["telegram_messages"] = messages
-        successes = [row for row in messages if row.get("status") == "sent"]
-        failures = [row for row in messages if row.get("status") != "sent"]
-        if successes:
-            report["status"] = "partial_sent" if failures else "sent"
-            report["reason"] = "; ".join(
-                f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
-            )
-        elif messages:
-            report["status"] = "send_failed"
-            report["reason"] = "; ".join(
-                f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
-            )
     append_jsonl(CLOSE_REPORTS_FILE, report)
     return report
 
@@ -342,9 +498,144 @@ def broker_order_report_message(status_report: dict[str, Any]) -> str:
     )
 
 
+def fill_price_from_status(status_report: dict[str, Any]) -> float | None:
+    return safe_float(status_report.get("filled_avg_price") or status_report.get("limit_price"))
+
+
+def fill_qty_from_status(status_report: dict[str, Any]) -> int:
+    return max(0, safe_int(status_report.get("filled_qty") or status_report.get("qty")) or 0)
+
+
+def fill_notional(status_report: dict[str, Any]) -> float | None:
+    price = fill_price_from_status(status_report)
+    qty = fill_qty_from_status(status_report)
+    if price is None or qty <= 0:
+        return None
+    return price * qty * 100
+
+
+def filled_time_from_status(status_report: dict[str, Any]) -> str:
+    for key in ("filled_at", "recorded_at", "submitted_at"):
+        if parse_datetime(status_report.get(key)) is not None:
+            return str(status_report.get(key))
+    raw_order = status_report.get("raw_order") or {}
+    for key in ("filled_at", "updated_at", "submitted_at"):
+        if parse_datetime(raw_order.get(key)) is not None:
+            return str(raw_order.get(key))
+    return ""
+
+
+def buy_fill_for_position(position_id: Any) -> dict[str, Any] | None:
+    if not position_id:
+        return None
+    for row in reversed(read_jsonl(BROKER_STATUS_REPORTS_FILE)):
+        if (
+            str(row.get("position_id") or "") == str(position_id)
+            and str(row.get("broker_status") or "").lower() == "filled"
+            and str(row.get("side") or "").lower() == "buy"
+        ):
+            return row
+    return None
+
+
+def total_sold_contracts_for_position(position_id: Any) -> int:
+    if not position_id:
+        return 0
+    order_ids: set[str] = set()
+    total = 0
+    for row in read_jsonl(BROKER_STATUS_REPORTS_FILE):
+        if (
+            str(row.get("position_id") or "") == str(position_id)
+            and str(row.get("broker_status") or "").lower() == "filled"
+            and str(row.get("side") or "").lower() == "sell"
+        ):
+            order_id = str(row.get("order_id") or row.get("client_order_id") or "")
+            if order_id and order_id in order_ids:
+                continue
+            if order_id:
+                order_ids.add(order_id)
+            total += fill_qty_from_status(row)
+    return total
+
+
+def position_contracts(position: dict[str, Any]) -> int | None:
+    quantity = safe_int(position.get("contracts"))
+    return quantity if quantity is not None and quantity >= 0 else None
+
+
+def fill_slippage_line(alert_price: float | None, fill_price: float | None) -> str:
+    if alert_price is None or fill_price is None or alert_price <= 0:
+        return "Alert -> fill: n/a"
+    delta = fill_price - alert_price
+    pct = (delta / alert_price) * 100
+    return f"Alert -> fill: {format_signed_money(delta)} / {format_signed_pct(pct)}"
+
+
+def broker_fill_executive_message(status_report: dict[str, Any]) -> str:
+    label = status_report.get("label") or status_report.get("contract_symbol") or "OPTION"
+    side_word = order_side_word(status_report.get("side"))
+    side = str(status_report.get("side") or "").lower()
+    qty = fill_qty_from_status(status_report)
+    fill_price = fill_price_from_status(status_report)
+    filled_time = filled_time_from_status(status_report)
+    position_id = status_report.get("position_id")
+    position = position_for_id(position_id)
+    alert_context = alert_context_for_status_report(status_report)
+    alert_text = str(alert_context.get("alert_text") or label)
+    alert_time = str(alert_context.get("alert_time") or position.get("opened_at") or "")
+    alert_price = safe_float(alert_context.get("alert_price"))
+    lines = [f"{side_word.upper()} FILLED [PAPER]", "", f"Alert {format_local_time(alert_time)}", alert_text, ""]
+    lines.extend(
+        [
+            f"Filled {format_local_time(filled_time)}",
+            str(label),
+            f"{side_word} {qty} @ {format_price(fill_price)} avg",
+        ]
+    )
+    notional = fill_notional(status_report)
+    if side == "buy":
+        lines.extend(
+            [
+                "",
+                f"Invested: {format_money_amount(notional)}",
+                fill_slippage_line(alert_price, fill_price),
+                f"Latency: {elapsed_text(alert_time, filled_time)}",
+                f"Position: {qty} open",
+            ]
+        )
+    elif side == "sell":
+        entry_fill = buy_fill_for_position(position_id)
+        entry_price = fill_price_from_status(entry_fill or {}) or safe_float(position.get("entry_price"))
+        pnl_dollars = (fill_price - entry_price) * qty * 100 if fill_price is not None and entry_price is not None else None
+        pnl_pct = ((fill_price - entry_price) / entry_price) * 100 if fill_price is not None and entry_price and entry_price > 0 else None
+        contracts = position_contracts(position)
+        sold_total = total_sold_contracts_for_position(position_id)
+        remaining = max(0, contracts - sold_total) if contracts is not None else None
+        reason = str(status_report.get("exit_reason") or status_report.get("reason") or "").replace("_", " ")
+        lines.extend(
+            [
+                "",
+                f"Proceeds: {format_money_amount(notional)}",
+                f"Realized P/L: {format_signed_money(pnl_dollars)} / {format_signed_pct(pnl_pct)}",
+                f"Remaining: {remaining if remaining is not None else 'n/a'} contracts",
+                f"Reason: {reason or 'paper sell fill'}",
+                f"Held: {elapsed_text(alert_time, filled_time)}",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def send_broker_order_report(status_report: dict[str, Any]) -> dict[str, Any]:
-    message = broker_order_report_message(status_report)
-    status, reason, messages = send_message_to_configured_chats(message)
+    is_filled = str(status_report.get("broker_status") or "").lower() == "filled"
+    message = broker_fill_executive_message(status_report) if is_filled else broker_order_report_message(status_report)
+    status, reason, messages = send_message_to_approval_chats(message)
+    if is_filled:
+        executive_status, executive_reason, executive_messages = send_message_to_executive_chats(message)
+        if executive_messages:
+            messages.extend(executive_messages)
+            status, reason = delivery_status_from_messages(messages)
+        elif status != "sent" and executive_reason:
+            reason = "; ".join(part for part in [reason, executive_reason] if part)
     report = {
         "event_type": "steve_broker_order_report",
         "order_id": status_report.get("order_id"),
@@ -355,6 +646,7 @@ def send_broker_order_report(status_report: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "reason": reason,
         "message_text": message,
+        "executive_sent": bool(is_filled and executive_messages),
         "telegram_messages": messages,
     }
     append_jsonl(BROKER_ORDER_REPORTS_FILE, report)
@@ -375,7 +667,7 @@ def daily_pl_report_message(summary: dict[str, Any]) -> str:
 
 def send_daily_pl_report(summary: dict[str, Any]) -> dict[str, Any]:
     message = daily_pl_report_message(summary)
-    status, reason, messages = send_message_to_configured_chats(message)
+    status, reason, messages = send_message_to_approval_chats(message)
     report = {
         "event_type": "daily_pl_report",
         "day": summary.get("day"),
@@ -747,76 +1039,82 @@ def send_auto_buy_report(
     position: dict[str, Any],
     broker_audit: dict[str, Any],
 ) -> dict[str, Any]:
-    config = load_bot_config(required=False)
     message = auto_buy_report_message(alert, snapshot, position, broker_audit)
+    status, reason, messages = send_message_to_approval_chats(message)
     report = {
         "event_type": "steve_auto_buy_report",
         "auto_paper_id": auto_paper_id_for_alert(alert),
         "position_id": position.get("position_id"),
         "source_dedupe_key": alert.get("source_dedupe_key"),
         "created_at": now_iso(),
-        "status": "telegram_disabled",
-        "reason": "missing_steve_trade_bot_env",
+        "status": status,
+        "reason": reason,
         "message_text": message,
         "broker_status": broker_audit.get("status"),
         "broker_reason": broker_audit.get("reason"),
-        "telegram_messages": [],
+        "telegram_messages": messages,
     }
-    if config is not None:
-        messages: list[dict[str, Any]] = []
-        for chat_id in configured_approval_chat_ids(config):
-            try:
-                response = send_telegram_message(config, message, chat_id=chat_id)
-                if not response.get("ok"):
-                    raise RuntimeError(f"Telegram returned non-ok response: {response}")
-                result = response.get("result", {})
-                chat = result.get("chat") or {}
-                messages.append(
-                    {
-                        "chat_id": str(chat.get("id") if chat.get("id") is not None else chat_id),
-                        "message_id": result.get("message_id"),
-                        "status": "sent",
-                        "reason": "",
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001
-                messages.append({"chat_id": str(chat_id), "message_id": None, "status": "send_failed", "reason": str(exc)})
-        report["telegram_messages"] = messages
-        successes = [row for row in messages if row.get("status") == "sent"]
-        failures = [row for row in messages if row.get("status") != "sent"]
-        if successes:
-            report["status"] = "partial_sent" if failures else "sent"
-            report["reason"] = "; ".join(
-                f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
-            )
-        elif messages:
-            report["status"] = "send_failed"
-            report["reason"] = "; ".join(
-                f"{row.get('chat_id')}:{row.get('reason')}" for row in failures if row.get("reason")
-            )
     append_jsonl(AUTO_BUY_REPORTS_FILE, report)
     return report
 
 
-def auto_paper_position_exists(auto_paper_id: str) -> bool:
+def auto_paper_position_exists(auto_paper_id: str, alert: dict[str, Any] | None = None) -> bool:
     position_id = "human-" + stable_hash([auto_paper_id, "human"])[:16]
-    return any(row.get("position_id") == position_id for row in read_jsonl(HUMAN_POSITIONS_FILE))
+    entry_key = canonical_option_entry_key(alert) if alert else ""
+    for row in read_jsonl(HUMAN_POSITIONS_FILE):
+        if row.get("position_id") == position_id:
+            return True
+        if entry_key and str(row.get("canonical_entry_key") or "") == entry_key:
+            return True
+    return False
+
+
+def auto_paper_buy_already_processed(auto_paper_id: str, alert: dict[str, Any] | None = None) -> bool:
+    source_key = str((alert or {}).get("source_dedupe_key") or "")
+    entry_key = canonical_option_entry_key(alert) if alert else ""
+    for row in read_jsonl(APPROVAL_ACTIONS_FILE):
+        if row.get("action") != "auto_approved":
+            continue
+        if row.get("approval_id") == auto_paper_id:
+            return True
+        if source_key and str(row.get("source_dedupe_key") or "") == source_key:
+            return True
+    for row in read_jsonl(AUTO_BUY_REPORTS_FILE):
+        if row.get("auto_paper_id") == auto_paper_id:
+            return True
+        if source_key and str(row.get("source_dedupe_key") or "") == source_key:
+            return True
+        position_id = str(row.get("position_id") or "")
+        if entry_key and position_id:
+            for position in read_jsonl(HUMAN_POSITIONS_FILE):
+                if str(position.get("position_id") or "") == position_id and str(position.get("canonical_entry_key") or "") == entry_key:
+                    return True
+    return False
 
 
 def auto_paper_buy(alert: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
     auto_paper_id = auto_paper_id_for_alert(alert)
-    already_exists = auto_paper_position_exists(auto_paper_id)
+    already_exists = auto_paper_position_exists(auto_paper_id, alert)
+    already_processed = auto_paper_buy_already_processed(auto_paper_id, alert)
     card = {
         "approval_id": auto_paper_id,
         "alert": alert,
         "snapshot": snapshot,
     }
     command = default_auto_buy_command()
-    position = create_human_position(card, command)
+    position = build_human_position(card, command)
     broker_audit = {"status": "skipped", "reason": "duplicate_auto_paper_position", "position_id": position.get("position_id")}
     report: dict[str, Any] = {}
-    if not already_exists:
+    if already_processed:
+        broker_audit = {
+            "status": "skipped",
+            "reason": "duplicate_auto_paper_buy_already_processed",
+            "position_id": position.get("position_id"),
+        }
+    elif not already_exists:
         broker_audit = submit_option_paper_order(position)
+        if broker_audit.get("status") == "submitted":
+            create_human_position(card, command)
         report = send_auto_buy_report(alert, snapshot, position, broker_audit)
     append_action(
         {
@@ -827,13 +1125,13 @@ def auto_paper_buy(alert: dict[str, Any], snapshot: dict[str, Any]) -> dict[str,
             "source_dedupe_key": alert.get("source_dedupe_key"),
             "broker_status": broker_audit.get("status"),
             "broker_reason": broker_audit.get("reason"),
-            "duplicate": already_exists,
+            "duplicate": already_exists or already_processed,
         }
     )
     return {
         "auto_paper_id": auto_paper_id,
         "position_id": position.get("position_id"),
-        "created": not already_exists,
+        "created": not already_exists and not already_processed,
         "position": position,
         "broker_audit": broker_audit,
         "report": report,
@@ -939,13 +1237,16 @@ def validate_command_for_card(card: dict[str, Any], command: dict[str, Any]) -> 
     return False, "missing_risk"
 
 
-def create_human_position(card: dict[str, Any], command: dict[str, Any]) -> dict[str, Any]:
+def build_human_position(card: dict[str, Any], command: dict[str, Any]) -> dict[str, Any]:
     approval_id = str(card["approval_id"])
     existing_position_id = "human-" + stable_hash([approval_id, "human"])[:16]
+    alert = card.get("alert") or {}
+    entry_key = canonical_option_entry_key(alert)
     for row in read_jsonl(HUMAN_POSITIONS_FILE):
         if row.get("position_id") == existing_position_id:
             return row
-    alert = card.get("alert") or {}
+        if entry_key and str(row.get("canonical_entry_key") or "") == entry_key:
+            return row
     snapshot = card.get("snapshot") or {}
     fill_price, fill_source = fill_price_from_card(card)
     contracts = int(command.get("contracts") or alert.get("contracts") or 1)
@@ -955,8 +1256,12 @@ def create_human_position(card: dict[str, Any], command: dict[str, Any]) -> dict
         "event_type": "human_paper_option_position",
         "position_id": existing_position_id,
         "approval_id": approval_id,
+        "canonical_entry_key": canonical_option_entry_key(alert),
         "opened_at": now_iso(),
         "source_dedupe_key": alert.get("source_dedupe_key"),
+        "alert_text": alert_text_from_alert(alert),
+        "alert_time": alert_time_from_alert(alert),
+        "alert_price": safe_float(alert.get("entry_price")),
         "ticker": alert.get("ticker"),
         "contract_symbol": snapshot.get("contract_symbol"),
         "option_type": alert.get("option_type"),
@@ -985,7 +1290,24 @@ def create_human_position(card: dict[str, Any], command: dict[str, Any]) -> dict
         ],
         "status": "open",
     }
-    append_jsonl(HUMAN_POSITIONS_FILE, position)
+    return position
+
+
+def human_position_already_recorded(position: dict[str, Any]) -> bool:
+    position_id = str(position.get("position_id") or "")
+    entry_key = str(position.get("canonical_entry_key") or "")
+    for row in read_jsonl(HUMAN_POSITIONS_FILE):
+        if position_id and str(row.get("position_id") or "") == position_id:
+            return True
+        if entry_key and str(row.get("canonical_entry_key") or "") == entry_key:
+            return True
+    return False
+
+
+def create_human_position(card: dict[str, Any], command: dict[str, Any]) -> dict[str, Any]:
+    position = build_human_position(card, command)
+    if not human_position_already_recorded(position):
+        append_jsonl(HUMAN_POSITIONS_FILE, position)
     return position
 
 
@@ -1010,8 +1332,6 @@ def sender_id_from_message(message: dict[str, Any]) -> str:
 def authorization_for_message(message: dict[str, Any], config: BotConfig) -> tuple[bool, str]:
     chat_id = chat_id_from_message(message)
     sender_id = sender_id_from_message(message)
-    if chat_id in {str(item) for item in configured_approval_chat_ids(config)}:
-        return True, "approval_group"
     if chat_id == str(config.owner_chat_id) and sender_id == str(config.owner_user_id):
         return True, "owner_dm"
     return False, "unauthorized_chat"
@@ -1097,8 +1417,10 @@ def process_approval_message(message: dict[str, Any], config: BotConfig) -> dict
         }
         append_action(row)
         return row
-    position = create_human_position(card, command)
+    position = build_human_position(card, command)
     broker_audit = submit_option_paper_order(position)
+    if broker_audit.get("status") == "submitted":
+        create_human_position(card, command)
     row = {
         "action": "approved",
         "approval_id": approval_id,

@@ -9,6 +9,8 @@ only for near-real-time browser capture where auto paper routing is intended.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,21 @@ from run_pipeline_once import normalize_parsed, process_raw_notifications
 
 BACKFILLS_FILE = DATA_DIR / "discord_text_backfills.jsonl"
 AUTHOR_PREFIXES = ("OTWSteve", "SteveOTWS", "@OTWSteve", "@SteveOTWS")
+ADD_LINE_RE = re.compile(r"\b(?:aaded|added|add)\s+(?P<contracts>\d+)\s+(?:@|at)\s*(?P<price>\d+(?:\.\d+)?|\.\d+)", re.I)
+MONTH_ABBR = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
 
 
 def clean_line(raw_line: str) -> str:
@@ -62,13 +79,14 @@ def unique_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
-def parsed_items_for_body(body: str, dedupe_key: str) -> list[dict[str, Any]]:
+def parsed_items_for_body(body: str, dedupe_key: str, source_time: str | None = None) -> list[dict[str, Any]]:
+    captured_at = now_iso()
     try:
         value = parse_trade_alert(
             {
                 "event_type": "raw_discord_ui_backfill",
-                "captured_at": now_iso(),
-                "notification_timestamp": "",
+                "captured_at": captured_at,
+                "notification_timestamp": source_time or "",
                 "source_app": "DiscordUI",
                 "bundle_id": "browser_or_clipboard",
                 "title": "OTWSteve",
@@ -83,27 +101,74 @@ def parsed_items_for_body(body: str, dedupe_key: str) -> list[dict[str, Any]]:
     return normalize_parsed(value)
 
 
-def build_raw_records(text: str, source: str, dedupe_scope: str | None = None) -> list[dict[str, Any]]:
+def materialize_add_body(entry: dict[str, Any], add_line: str) -> str | None:
+    match = ADD_LINE_RE.search(add_line)
+    if not match:
+        return None
+    expiration_text = str(entry.get("expiration_date") or "")
+    try:
+        expiration = dt.date.fromisoformat(expiration_text)
+    except ValueError:
+        return None
+    month = MONTH_ABBR.get(expiration.month)
+    if not month:
+        return None
+    ticker = str(entry.get("ticker") or "").upper()
+    option_type = str(entry.get("option_type") or "").lower()
+    strike = entry.get("strike_price")
+    if not ticker or not option_type or strike in (None, ""):
+        return None
+    tags = " ".join(f"#{tag}" for tag in (entry.get("tags") or []) if tag)
+    add_body = (
+        f"#{ticker} {month} {expiration.day} {float(strike):g} {option_type} "
+        f"@ {float(match.group('price')):g} added {int(match.group('contracts'))}"
+    )
+    return f"{add_body} {tags}".strip()
+
+
+def build_raw_records(
+    text: str,
+    source: str,
+    dedupe_scope: str | None = None,
+    suppress_context_entries: bool = False,
+    source_time: str | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     last_entry_context = ""
+    last_entry_alert: dict[str, Any] | None = None
     dedupe_seed = dedupe_scope or source
+    captured_at = now_iso()
+    parsed_lines: list[tuple[str, list[dict[str, Any]], list[dict[str, Any]]]] = []
+    has_exit_context = False
     for line in useful_lines(text):
         key = "ui-" + stable_hash([dedupe_seed, line])[:24]
-        parsed = parsed_items_for_body(line, key)
+        parsed = parsed_items_for_body(line, key, source_time=source_time)
         entries = [item for item in parsed if is_option_entry(item)]
         exits = [item for item in parsed if is_option_exit(item)]
+        if exits:
+            has_exit_context = True
+        parsed_lines.append((line, entries, exits))
+    for line, entries, exits in parsed_lines:
         if entries:
             body = line
             last_entry_context = entries[-1].get("matched_text") or line
+            last_entry_alert = entries[-1]
+            if suppress_context_entries and has_exit_context:
+                continue
         elif exits:
             body = f"{last_entry_context}\n{line}" if last_entry_context else line
+        elif last_entry_alert:
+            add_body = materialize_add_body(last_entry_alert, line)
+            if not add_body:
+                continue
+            body = add_body
         else:
             continue
         records.append(
             {
                 "event_type": "raw_discord_ui_backfill",
-                "captured_at": now_iso(),
-                "notification_timestamp": "",
+                "captured_at": captured_at,
+                "notification_timestamp": source_time or "",
                 "source_app": "DiscordUI",
                 "bundle_id": "browser_or_clipboard",
                 "title": "OTWSteve",

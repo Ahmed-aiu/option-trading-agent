@@ -4,7 +4,7 @@ set -eu
 PROJECT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 mkdir -p logs
-BROWSER_WATCHER_INTERVAL_SECONDS="${BROWSER_WATCHER_INTERVAL_SECONDS:-5}"
+BROWSER_WATCHER_INTERVAL_SECONDS="${BROWSER_WATCHER_INTERVAL_SECONDS:-3}"
 
 echo "Seeding current visible Discord history as already seen..."
 python3 scripts/discord_browser_channel_watcher.py --mark-existing --max-age-minutes 0

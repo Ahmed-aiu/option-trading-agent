@@ -49,6 +49,7 @@ Every weekday after market close:
 8. Run tests before making changes live.
 9. Send a short Telegram summary of what changed, what is still a hypothesis, and what data the next real session should collect.
 10. If browser refresh or browser health shows repeated `Chrome AppleScript read timed out` errors across channels, treat it as a foreground-browser recovery issue, not a parser issue: keep browser truth as the audit source, avoid guessing missing alerts, and restart browser capture with `scripts/run_browser_watcher_foreground.sh` for the next session instead of assuming the background LaunchAgent is sufficient.
+11. If alert timestamps show Steve posted while the laptop was asleep/off or before the watcher started, classify the delay as machine-availability/startup-backfill latency. Do not treat that evidence as parser slowness or a reason to chase stale alerts.
 
 ## Source Of Truth Rules
 
@@ -98,6 +99,7 @@ Allowed automatic changes when evidence supports them:
 Allowed paper-trading policy changes:
 
 - Make paper routing faster and more complete when the alert is unambiguous.
+- Treat unambiguous `#hedge` option buys the same as other unambiguous Steve option buys: auto-enter them for paper validation when the quote/latency guard passes, and only send Telegram approval when the contract context or entry guard is not good enough.
 - Add slippage, stale-quote, near-close, or wide-spread guardrails when data shows bad execution and the likely cause is understood.
 - Treat repeated `entry_price_worse_than_alert` findings as an investigation trigger: compare capture latency, quote age, spread, order timing, and fill quality before tightening auto-entry behavior.
 - Keep alert-price slippage caps explicit and configurable (`OPENCLAW_MAX_ENTRY_SLIPPAGE_PCT`) so approval/default fills do not blindly chase stale quotes above policy.
@@ -120,6 +122,8 @@ Before changing code, preserve a rollback point:
 - Prefer a git commit or branch if the tree is clean enough.
 - If the tree is dirty, write a short rollback note in the nightly report naming changed files and the previous report/commit.
 - Keep previous `SKILL.md` content recoverable through git history or an archived copy.
+
+Do not push automatically from the live trading loop, browser watcher, health monitor, or nightly review. Git publishing is a separate gated operation: tests must pass, unsafe files must be absent from the staged set, and an explicit operator action or one-run opt-in must approve the push. See `docs/GITHUB_PUBLISHING.md`.
 
 After changes:
 

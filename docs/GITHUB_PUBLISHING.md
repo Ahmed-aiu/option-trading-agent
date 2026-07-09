@@ -32,6 +32,27 @@ git diff --check
 
 Confirm ignored files include `.env.local`, `config/watcher.yaml`, `data/`, and `logs/`.
 
+## Auto-Push Policy
+
+Do not let the live trading pipeline, browser watcher, health monitor, or nightly review push directly to git. Those processes can generate evidence, reports, and candidate changes, but publishing code is a separate gated operation.
+
+Acceptable automation boundary:
+
+- Prepare a patch.
+- Run the required tests.
+- Show `git status -sb`, `git diff --stat`, and the staged file list.
+- Refuse to continue if unsafe files are staged.
+- Commit and push only when an explicit operator action or explicit opt-in environment variable is present.
+
+Required auto-push gates if a helper script is added later:
+
+- `OPENCLAW_ALLOW_GIT_PUSH=true` or an equivalent one-run approval.
+- Current branch has an upstream remote.
+- No staged files matching `.env*`, `config/watcher.yaml`, `data/**`, `logs/**`, `*.local.plist`, screenshots, or copied Discord history.
+- Required tests and `git diff --check` pass in the same run.
+- Commit message includes the nightly report date or manual reason.
+- Push target is the current branch's upstream, not an arbitrary remote URL.
+
 ## Commit Scope
 
 Safe commit scope:
@@ -41,7 +62,7 @@ Safe commit scope:
 - LaunchAgent templates under `launchd/`.
 - Human docs under `README.md` and `docs/`.
 - LLM/Codex operating docs under `AGENTS.md` and `SKILL.md`.
-- Tests and static samples that do not contain private account data.
+- Tests and deterministic fixtures that do not contain private Discord/account data.
 
 Unsafe commit scope:
 
@@ -49,6 +70,7 @@ Unsafe commit scope:
 - Local macOS or Telegram IDs unless intentionally documented as examples.
 - Secrets or credentials.
 - Any copied private Discord history.
+- Local screenshots, browser exports, or generated reports that include private channel text.
 
 ## Recommended Repo Description
 

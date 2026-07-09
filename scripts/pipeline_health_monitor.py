@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from notification_probe import probe_notification_db
 from notification_watcher import is_matching_notification, normalize_raw
 from pipeline_common import CONFIG_DIR, DATA_DIR, LOG_DIR, append_jsonl, load_seen_keys, load_simple_yaml, now_iso, parse_datetime, read_jsonl, setup_logging
-from steve_trade_bot import configured_approval_chat_ids, load_bot_config, send_telegram_message
+from steve_trade_bot import send_message_to_approval_chats
 
 
 HEALTH_CHECKS_FILE = DATA_DIR / "pipeline_health_checks.jsonl"
@@ -330,13 +330,13 @@ def check_routing(sla_seconds: int, tz_name: str) -> list[Issue]:
             continue
         tags = {str(tag).lower() for tag in (parsed.get("tags") or [])}
         if "hedge" in tags:
-            if key not in cards:
+            if key not in cards and key not in auto_reports and key not in human_positions:
                 issues.append(
                     Issue(
                         stage="routing",
                         code="hedge_missing_approval_card",
                         severity="critical",
-                        message="Parsed hedge alert did not create a Telegram approval card.",
+                        message="Parsed hedge alert did not create approval or paper-buy artifacts.",
                         evidence={"source_dedupe_key": key, "ticker": parsed.get("ticker"), "raw_text": str(parsed.get("raw_text") or "")[:180]},
                     )
                 )
@@ -421,29 +421,18 @@ def alert_message(record: dict[str, Any], new_issues: list[Issue], recovered: li
 
 
 def send_health_alert(record: dict[str, Any], new_issues: list[Issue], recovered: list[str] | None = None) -> None:
-    config = load_bot_config(required=False)
     message = alert_message(record, new_issues, recovered)
+    telegram_status, reason, messages = send_message_to_approval_chats(message)
     alert_record = {
         "event_type": "pipeline_health_alert",
         "recorded_at": now_iso(),
         "status": record.get("status"),
+        "delivery_audience": "approval_dm",
+        "telegram_status": telegram_status,
+        "reason": reason,
         "message_text": message,
-        "telegram_messages": [],
+        "telegram_messages": messages,
     }
-    if config is None:
-        alert_record["status"] = "telegram_disabled"
-        alert_record["reason"] = "missing_steve_trade_bot_env"
-        append_jsonl(HEALTH_ALERTS_FILE, alert_record)
-        return
-    messages = []
-    for chat_id in configured_approval_chat_ids(config):
-        try:
-            response = send_telegram_message(config, message, chat_id=chat_id)
-            result = response.get("result", {}) if response.get("ok") else {}
-            messages.append({"chat_id": str(chat_id), "message_id": result.get("message_id"), "status": "sent" if response.get("ok") else "send_failed", "reason": "" if response.get("ok") else str(response)})
-        except Exception as exc:  # noqa: BLE001
-            messages.append({"chat_id": str(chat_id), "message_id": None, "status": "send_failed", "reason": str(exc)})
-    alert_record["telegram_messages"] = messages
     append_jsonl(HEALTH_ALERTS_FILE, alert_record)
 
 

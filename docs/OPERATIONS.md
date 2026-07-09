@@ -9,7 +9,7 @@ cp config/watcher.example.yaml config/watcher.yaml
 
 Fill `.env.local` with Telegram and Alpaca paper credentials. Fill `config/watcher.yaml` with the Discord authors and channel IDs to watch.
 
-For Telegram, `STEVE_TRADE_APPROVAL_CHAT_IDS` can contain comma-separated destinations. Use it when cards should go to both the owner DM and an approval group.
+For Telegram, approvals are DM-only. Set `STEVE_TRADE_OWNER_CHAT_ID` to your private chat and `STEVE_TRADE_OWNER_USER_ID` to your Telegram user id. Put group destinations in `STEVE_TRADE_EXECUTIVE_CHAT_ID` or `STEVE_TRADE_EXECUTIVE_CHAT_IDS`; those groups receive only filled paper buy/sell summaries plus one nightly executive summary. Approval cards, submitted/pending statuses, close reports, daily P/L, full nightly diagnostics, and health alerts stay out of the group.
 
 ## Validate Capture
 
@@ -80,7 +80,7 @@ Near-real-time browser capture can use live mode only when the text is fresh eno
 pbpaste | python3 scripts/backfill_steve_text.py --mode live --source browser_poll
 ```
 
-Live mode writes records into `data/raw_notifications.jsonl`, so normal routing applies: non-hedge alerts can auto-paper-buy, while hedge alerts still request Telegram approval.
+Live mode writes records into `data/raw_notifications.jsonl`, so normal routing applies: fresh guard-passing option buys can auto-paper-buy, while guard-blocked or context-incomplete alerts request owner-DM Telegram approval.
 
 ## Chrome Visible Discord Capture
 
@@ -110,7 +110,7 @@ Run continuously during market hours from a foreground Terminal session:
 scripts/run_browser_watcher_foreground.sh
 ```
 
-This foreground runner uses `caffeinate` and is preferred over LaunchAgent for browser capture because Chrome Apple Events can time out from a background LaunchAgent while succeeding from an interactive Terminal session. It polls every 5 seconds by default; override with `BROWSER_WATCHER_INTERVAL_SECONDS=3 scripts/run_browser_watcher_foreground.sh` only if the nightly capture scorecard shows browser latency is still too high.
+This foreground runner uses `caffeinate` and is preferred over LaunchAgent for browser capture because Chrome Apple Events can time out from a background LaunchAgent while succeeding from an interactive Terminal session. It polls every 3 seconds by default because the 2026-07-08 capture scorecard showed browser capture was primary but still late; override with `BROWSER_WATCHER_INTERVAL_SECONDS=5 scripts/run_browser_watcher_foreground.sh` if later scorecards show stable low latency.
 
 The browser watcher writes:
 
@@ -120,7 +120,9 @@ data/discord_browser_health.jsonl
 data/discord_browser_health_latest.json
 ```
 
-If it sees a fresh Steve message, it writes a raw record to `data/raw_notifications.jsonl`; the existing parser/router then handles auto paper buys, hedge approvals, and Steve exits.
+If it sees a fresh Steve message, it writes a raw record to `data/raw_notifications.jsonl`; the existing parser/router then handles guard-passing auto paper buys, approval fallback, and Steve exits.
+
+Keep the laptop awake, logged in, and connected before market open. If the machine was asleep/off until after Steve posted an alert, browser history can still recover that message for audit, but it should be treated as startup backfill latency and not as evidence that the live-running parser was slow.
 
 The nightly review reports a capture-method scorecard comparing browser capture and macOS notifications by coverage, latency, and duplicate rate:
 
@@ -168,7 +170,7 @@ Failure codes identify where the miss happened:
 - `notification_db_row_not_raw`: macOS stored a Discord notification, but the watcher did not capture it.
 - `browser_message_not_raw`: browser saw a Steve message, but no raw pipeline record exists.
 - `raw_not_processed`: raw exists, parser/router did not process it.
-- `hedge_missing_approval_card`: parsed hedge alert did not create Telegram approval.
+- `hedge_missing_approval_card`: legacy signal for a hedge alert that was expected to need approval. Current routing can auto-enter unambiguous hedges when guardrails pass; investigate only if the nightly evidence says approval fallback was expected.
 - `non_hedge_missing_auto_buy`: parsed non-hedge alert did not create auto paper-buy artifacts.
 - `option_exit_not_recorded`: parsed Steve exit did not create an exit record.
 - `*_send_failed`: Telegram delivery failed.
@@ -223,9 +225,9 @@ scripts/uninstall_launch_agent.sh
 
 ## Telegram Approval Commands
 
-Non-hedge Steve option alerts are auto-routed to paper trading. The bot writes a local paper position, attempts the Alpaca paper option order when paper submission is enabled, and sends an `AUTO PAPER BUY` Telegram report to the configured approval destinations.
+Fresh guard-passing Steve option alerts are auto-routed to paper trading, including unambiguous `#hedge` alerts. The bot writes a local paper position, attempts the Alpaca paper option order when paper submission is enabled and the paper market is open, and sends an `AUTO PAPER BUY` Telegram report to the owner operational destination.
 
-Hedge alerts still require explicit human approval:
+Guard-blocked or context-incomplete alerts require explicit owner-DM approval:
 
 ```text
 skip

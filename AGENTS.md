@@ -20,8 +20,8 @@ macOS Discord notification and/or Chrome Discord browser watcher
  -> scripts/parse_alert.py
  -> scripts/option_validation.py
  -> scripts/steve_trade_bot.py
- -> Telegram human approval
- -> local paper ledgers
+ -> auto local paper entry or owner-DM Telegram approval
+ -> local paper ledgers and optional Alpaca paper order audits
 ```
 
 The continuous process is `scripts/run_live_pipeline.py`. On macOS it is installed through `scripts/install_launch_agent.sh`.
@@ -42,13 +42,14 @@ Nightly reports include a capture-method scorecard. Use it to decide whether bro
 
 - `scripts/parse_alert.py`: deterministic parser for Steve-style option entries and exits.
 - `scripts/option_validation.py`: shadow buy-all ledger, quote snapshots, human paper exit rules, daily reports.
-- `scripts/steve_trade_bot.py`: Telegram approval cards, reply parsing, human paper entry ledger.
+- `scripts/steve_trade_bot.py`: Telegram approval cards, reply parsing, auto/approved paper entry ledger, executive fill summaries.
 - `scripts/alpaca_options.py`: Alpaca data enrichment and optional paper option order audit.
 - `scripts/alpaca_paper_adapter.py`: stock paper order adapter and paper endpoint guard.
 - `scripts/nightly_review.py`: post-market source-of-truth reconciliation and improvement report.
 - `config/parser_patterns.yaml`: parser feature flags and ambiguous phrase policy.
-- `config/risk.yaml`: conservative stock risk policy. Options are handled by manual approval.
+- `config/risk.yaml`: conservative stock risk policy. Steve options use dedicated option validation, auto-entry guards, and owner-DM approval fallback.
 - `config/watcher.example.yaml`: sanitized watcher config template. Local `config/watcher.yaml` is ignored.
+- `docs/LLM_HANDOFF.md`: short read order, invariants, trace keys, and git policy for future coding agents.
 
 ## Tests
 
@@ -80,9 +81,17 @@ Append-only ledgers live under `data/` and are intentionally ignored by git. The
 - `option_quote_snapshots.jsonl`
 - `steve_approval_cards.jsonl`
 - `steve_approval_actions.jsonl`
+- `steve_auto_buy_reports.jsonl`
+- `steve_broker_order_reports.jsonl`
 - `steve_close_reports.jsonl`
 - `human_paper_positions.jsonl`
 - `human_paper_exits.jsonl`
+- `orders_paper.jsonl`
+- `broker_order_status_reports.jsonl`
+- `pipeline_health_checks.jsonl`
+- `steve_alert_pl_reports.jsonl`
+- `broker_fill_pl_reports.jsonl`
+- `data_hygiene_reports.jsonl`
 - `daily_option_summaries.jsonl`
 - `nightly_review_reports.jsonl`
 

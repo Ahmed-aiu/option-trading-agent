@@ -9,7 +9,7 @@
     <string>__PYTHON_BIN__</string>
     <string>__PROJECT_DIR__/scripts/discord_browser_channel_watcher.py</string>
     <string>--interval</string>
-    <string>5</string>
+    <string>3</string>
     <string>--timeout</string>
     <string>30</string>
     <string>--retries</string>

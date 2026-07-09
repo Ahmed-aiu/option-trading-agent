@@ -12,11 +12,11 @@ This is not an investment-advice or live-trading project. It is built to collect
 - Parses deterministic Steve option entries, partial exits, full closes, contextual stops, and some stock-alert patterns into structured JSON.
 - Rejects unsupported or ambiguous messages with exact audit reasons.
 - Creates shadow "buy all Steve alerts" positions for validation.
-- Auto-routes non-hedge option alerts into local paper trades.
-- Sends hedge or ambiguous alerts to a dedicated Telegram approval bot.
+- Auto-routes fresh, unambiguous option alerts into local paper trades when guardrails pass, including `#hedge` alerts.
+- Sends guard-blocked or ambiguous alerts to a dedicated Telegram approval bot.
 - Tracks option quote snapshots, local paper positions, exits, P/L, and Steve close behavior.
 - Attempts Alpaca paper option orders only when explicitly enabled.
-- Sends Telegram auto-buy, close, health, and daily P/L reports.
+- Sends operational Telegram reports to owner DM and outcome-only filled-trade/nightly summaries to the executive group.
 - Runs health monitors and nightly source-of-truth reviews.
 - Replays JSONL files for parser/risk testing.
 
@@ -51,10 +51,9 @@ Discord Steve alert
  -> nightly_review.py after close
 ```
 
-Default paper routing:
-
-- `#hedge`: requires Telegram approval because it may not make sense without the portfolio context being hedged.
-- Non-hedge options such as `#swing`, `#lotto`, or no tag: auto paper buy using the alert contract count.
+- Fresh unambiguous option buys, including `#hedge`, `#swing`, `#lotto`, or no tag: auto paper buy using Steve's alert contract count when the quote and latency guard passes.
+- Guard-blocked or context-incomplete alerts: send an owner-DM Telegram approval card instead of immediate paper entry.
+- Stale raw alerts, including alerts recovered after the laptop was asleep/off, are audit evidence and should not be routed as fresh trades.
 - Default stop: `-35%`.
 - Default take-profit plan: +80%, +120%, +200% ladder.
 - Steve partial closes are cumulative catch-up exits. The local paper ledger only sells additional contracts when Steve has closed more than the bot already closed through targets/stops.
@@ -68,11 +67,14 @@ There are two live capture methods:
 
 The nightly review compares methods by capture rate, latency, and duplicates. If browser capture keeps outperforming notifications, keep it primary and use notifications as backup/dedupe evidence.
 
+For timely paper entries, the laptop must be awake, logged in, Chrome must have the Discord channels available, and the live pipeline plus browser watcher should be running before market open, ideally by 9:25 AM ET. Browser history can recover messages after a shutdown for audit, but it cannot place a paper order at the original alert time.
+
 ## Repo Map
 
 - `AGENTS.md`: short onboarding notes for Codex/LLM coding agents.
 - `SKILL.md`: nightly recursive improvement operating guide for Codex/LLM agents.
 - `docs/ARCHITECTURE.md`: pipeline, ledgers, and module responsibilities.
+- `docs/LLM_HANDOFF.md`: quick operating map for future coding agents.
 - `docs/OPERATIONS.md`: local runbook for capture, Telegram approvals, and reports.
 - `docs/EXIT_STRATEGY.md`: current exit behavior and next policies to test.
 - `docs/GITHUB_PUBLISHING.md`: safe GitHub publishing checklist.
@@ -86,7 +88,8 @@ Future coding agents should read these first:
 1. `AGENTS.md` for hard safety rules and key files.
 2. `SKILL.md` for the nightly recursive improvement process.
 3. `docs/ARCHITECTURE.md` for ledgers and module responsibilities.
-4. `docs/OPERATIONS.md` for local run/monitoring commands.
+4. `docs/LLM_HANDOFF.md` for the shortest end-to-end trace map.
+5. `docs/OPERATIONS.md` for local run/monitoring commands.
 
 Important constraint: preserve paper-only behavior unless the user explicitly requests otherwise and tests are added for the new boundary.
 
@@ -223,7 +226,7 @@ The browser watcher should run in a foreground Terminal session during market ho
 scripts/run_browser_watcher_foreground.sh
 ```
 
-It uses `caffeinate`, polls every 5 seconds by default, and writes browser health records that the health monitor checks.
+It uses `caffeinate`, polls every 3 seconds by default, and writes browser health records that the health monitor checks.
 
 Archive and clear runtime JSONL files before a clean market-hours test:
 
@@ -246,18 +249,24 @@ Set these locally in `.env.local` or your shell:
 
 ```sh
 STEVE_TRADE_BOT_TOKEN=...
-STEVE_TRADE_APPROVAL_CHAT_ID=-100...
-STEVE_TRADE_APPROVAL_CHAT_IDS=123456789,-100...
-STEVE_TRADE_OWNER_CHAT_ID=...
+STEVE_TRADE_OWNER_CHAT_ID=123456789
 STEVE_TRADE_OWNER_USER_ID=...
+STEVE_TRADE_EXECUTIVE_CHAT_ID=-100...
+STEVE_TRADE_EXECUTIVE_CHAT_IDS=
 ```
 
-`STEVE_TRADE_APPROVAL_CHAT_ID` is the primary Telegram destination. `STEVE_TRADE_APPROVAL_CHAT_IDS` is optional and can add comma-separated destinations, such as your owner DM plus one approval group. Any member who can write in an approval group can approve or skip. Outside configured approval chats, only the configured owner DM is accepted. Messages from any other chat are logged as unauthorized.
+`STEVE_TRADE_OWNER_CHAT_ID` is the only approval destination. Approval cards, `buy`, and `skip` commands are accepted only from that DM and only from `STEVE_TRADE_OWNER_USER_ID`.
+
+`STEVE_TRADE_EXECUTIVE_CHAT_ID` and `STEVE_TRADE_EXECUTIVE_CHAT_IDS` are optional group/report destinations for filled paper buy/sell summaries and one nightly executive summary. The group does not get approval cards, auto-buy submitted notices, close reports, broker submitted/pending statuses, daily P/L, or health alerts. Group replies are logged as unauthorized.
+
+Filled buy/sell group messages use a short executive format: original alert time/text, actual broker fill time/price, invested or proceeds, P/L where applicable, and latency/hold time.
+
+Legacy names `STEVE_TRADE_APPROVAL_CHAT_ID`, `STEVE_TRADE_APPROVAL_CHAT_IDS`, `STEVE_TRADE_APPROVER_CHAT_ID`, and `STEVE_TRADE_APPROVER_USER_ID` still load for old local setups. Any non-owner chat still listed in the old approval chat variables is treated as an executive destination, not an approval destination.
 
 To find the group id:
 
 1. Create the new Telegram bot with BotFather.
-2. Add it to the specific approval group.
+2. Add it to the executive summary group.
 3. Send any message in the group, such as `hello`.
 4. Run:
 
@@ -265,11 +274,9 @@ To find the group id:
 python3 scripts/steve_trade_bot.py discover-chats
 ```
 
-5. Use the printed `chat_id` for `STEVE_TRADE_APPROVAL_CHAT_ID` or add multiple values to `STEVE_TRADE_APPROVAL_CHAT_IDS`. Telegram supergroup ids usually look like `-100...`. Use your private chat row for `STEVE_TRADE_OWNER_CHAT_ID` and `sender_user_id` for `STEVE_TRADE_OWNER_USER_ID`.
+5. Use the printed group `chat_id` for `STEVE_TRADE_EXECUTIVE_CHAT_ID`. Telegram supergroup ids usually look like `-100...`. Use your private chat row for `STEVE_TRADE_OWNER_CHAT_ID` and `sender_user_id` for `STEVE_TRADE_OWNER_USER_ID`.
 
-Legacy names `STEVE_TRADE_APPROVER_CHAT_ID` and `STEVE_TRADE_APPROVER_USER_ID` still work for the old one-person DM setup, but the group setup should use the new names above.
-
-The live pipeline sends approval cards for parsed Steve-style option alerts and polls Telegram replies locally:
+The live pipeline sends owner-DM approval cards only for guard-blocked or context-incomplete Steve-style option alerts, then polls Telegram replies locally:
 
 ```text
 skip
@@ -278,7 +285,7 @@ buy contracts=1 stop=35% take=80%
 buy contracts=1 stop_price=3.80 take_price=6.20
 ```
 
-Approvals always write a local human paper ledger. Alpaca paper option submission is attempted only when paper credentials and `OPENCLAW_ENABLE_PAPER_ORDERS=true` are configured; otherwise the broker attempt is logged as blocked and local paper tracking continues.
+Auto paper buys and approved buys always write a local human paper ledger first. Alpaca paper option submission is attempted only when paper credentials and `OPENCLAW_ENABLE_PAPER_ORDERS=true` are configured, the Alpaca endpoint is paper, and the market clock says orders are open; otherwise the broker attempt is logged as blocked and local paper tracking continues.
 
 The default local paper exit plan is staged: sell half the approved contracts at +80%, half of the remaining contracts at +120%, and the rest at +200%. For a single contract, the whole contract exits at +80%. Steve partial closes are treated as a cumulative catch-up target: if Steve has closed 2 contracts and the local paper plan already closed 2 or more, no extra sell is recorded; if Steve moves ahead of the local exits, the ledger closes only enough contracts to catch up.
 
@@ -422,4 +429,10 @@ Runtime ledgers, logs, local Telegram/Alpaca secrets, and local Discord channel 
 
 ## Next Phase
 
-The next phase should focus on validation reporting and paper exit reconciliation before any stronger automation: cleaner daily P/L summaries, reviewable Telegram exit notifications, and stricter handling for stale option quotes.
+Near-term improvement should focus on operational reliability and traceability before adding stronger automation:
+
+- Classify laptop-asleep/off startup backfills separately from live pipeline latency.
+- Keep browser capture primary while its scorecard outperforms notifications, but only tune polling from scorecard evidence.
+- Keep local policy P/L, broker-fill P/L, and Steve-alert P/L separate.
+- Add a gated git publishing flow for tested code changes, not fully autonomous pushes from the trading loop.
+- Keep docs and tests updated with every behavior change so a human or new LLM can trace one alert from Discord truth to final ledger outcome.

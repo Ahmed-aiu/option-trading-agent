@@ -56,7 +56,7 @@ def is_option_exit(alert: dict[str, Any]) -> bool:
         alert.get("event_type") == "parsed_trade_alert"
         and alert.get("instrument_type") == "option"
         and alert.get("side") == "exit"
-        and alert.get("exit_price") is not None
+        and (alert.get("exit_price") is not None or alert.get("exit_action") == "stopped_out")
     )
 
 
@@ -66,17 +66,86 @@ def is_hedge_alert(alert: dict[str, Any]) -> bool:
     return primary_tag == "hedge" or "hedge" in tags
 
 
-def validation_id(alert: dict[str, Any]) -> str:
-    return "val-" + stable_hash(
+def price_key(value: Any) -> str:
+    price = safe_float(value)
+    return f"{price:.2f}" if price is not None else ""
+
+
+def exit_price_key(alert: dict[str, Any]) -> str:
+    if alert.get("exit_price") is not None:
+        return price_key(alert.get("exit_price"))
+    if alert.get("exit_action") == "stopped_out":
+        return "context_stop"
+    return ""
+
+
+def int_key(value: Any) -> str:
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        return ""
+
+
+def strike_key(value: Any) -> str:
+    strike = safe_float(value)
+    return f"{strike:g}" if strike is not None else ""
+
+
+def option_type_key(value: Any) -> str:
+    text = str(value or "").lower()
+    if text.startswith("call"):
+        return "call"
+    if text.startswith("put"):
+        return "put"
+    return text
+
+
+def alert_contract_key(alert: dict[str, Any]) -> str:
+    contract_symbol = str(alert.get("contract_symbol") or "").upper()
+    if contract_symbol:
+        return contract_symbol
+    return "|".join(
         [
-            alert.get("source_dedupe_key"),
-            alert.get("ticker"),
-            alert.get("expiration_date"),
-            alert.get("option_type"),
-            alert.get("strike_price"),
-            alert.get("entry_price"),
+            str(alert.get("ticker") or "").upper(),
+            str(alert.get("expiration_date") or ""),
+            strike_key(alert.get("strike_price")),
+            option_type_key(alert.get("option_type")),
         ]
-    )[:16]
+    )
+
+
+def normalized_text_key(value: Any) -> str:
+    return " ".join(str(value or "").split()).lower()
+
+
+def alert_time_bucket(alert: dict[str, Any]) -> str:
+    for key in ("notification_timestamp", "captured_at", "opened_at", "recorded_at", "submitted_at"):
+        parsed = parse_datetime(alert.get(key))
+        if parsed is not None:
+            return parsed.isoformat(timespec="minutes")
+    return ""
+
+
+def canonical_option_entry_key(alert: dict[str, Any]) -> str:
+    entry_price = alert.get("entry_price")
+    if entry_price in (None, ""):
+        entry_price = alert.get("alert_entry_price")
+    time_bucket = alert_time_bucket(alert)
+    if not time_bucket:
+        time_bucket = "raw:" + stable_hash([normalized_text_key(alert.get("matched_text") or alert.get("raw_text"))])[:12]
+    return "|".join(
+        [
+            "entry",
+            alert_contract_key(alert),
+            price_key(entry_price),
+            int_key(alert.get("contracts") or 1),
+            time_bucket,
+        ]
+    )
+
+
+def validation_id(alert: dict[str, Any]) -> str:
+    return "val-" + stable_hash([canonical_option_entry_key(alert)])[:16]
 
 
 def position_id_for_alert(alert: dict[str, Any]) -> str:
@@ -85,6 +154,18 @@ def position_id_for_alert(alert: dict[str, Any]) -> str:
 
 def existing_values(path: Path, key: str) -> set[str]:
     return {str(row.get(key)) for row in read_jsonl(path) if row.get(key)}
+
+
+def existing_shadow_position_for_entry(alert: dict[str, Any]) -> dict[str, Any] | None:
+    entry_key = canonical_option_entry_key(alert)
+    position_id = position_id_for_alert(alert)
+    for row in read_jsonl(SHADOW_POSITIONS_FILE):
+        if row.get("position_id") == position_id:
+            return row
+        row_key = str(row.get("canonical_entry_key") or canonical_option_entry_key(row))
+        if row_key == entry_key:
+            return row
+    return None
 
 
 def alert_contract_symbol(alert: dict[str, Any]) -> str:
@@ -222,6 +303,7 @@ def snapshot_record_for_storage(
     record = compact_market_snapshot(snapshot, profile=storage_profile) if storage_profile != "entry_full_v1" else dict(snapshot)
     record["source_dedupe_key"] = alert.get("source_dedupe_key")
     record["validation_id"] = validation_id(alert)
+    record["canonical_entry_key"] = canonical_option_entry_key(alert)
     record["position_id"] = position_id
     record["storage_profile"] = storage_profile
     return record
@@ -250,16 +332,16 @@ def enrich_tracking_snapshot(alert: dict[str, Any]) -> dict[str, Any]:
 
 def create_shadow_position(alert: dict[str, Any], snapshot: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     position_id = position_id_for_alert(alert)
-    if position_id in existing_values(SHADOW_POSITIONS_FILE, "position_id"):
-        for row in read_jsonl(SHADOW_POSITIONS_FILE):
-            if row.get("position_id") == position_id:
-                return row, False
+    existing = existing_shadow_position_for_entry(alert)
+    if existing:
+        return existing, False
     bot_price, bot_price_source = quote_entry_price(snapshot)
     alert_price = float(alert.get("entry_price"))
     position = {
         "event_type": "shadow_option_position",
         "position_id": position_id,
         "validation_id": validation_id(alert),
+        "canonical_entry_key": canonical_option_entry_key(alert),
         "created_at": now_iso(),
         "opened_at": alert.get("notification_timestamp") or alert.get("parsed_at") or now_iso(),
         "source_dedupe_key": alert.get("source_dedupe_key"),
@@ -303,11 +385,7 @@ def handle_option_entry(alert: dict[str, Any], send_approval: bool = True) -> di
     auto_buy: dict[str, Any] | None = None
     guard = auto_entry_guard(alert, snapshot)
     if send_approval:
-        if is_hedge_alert(alert):
-            from steve_trade_bot import send_approval_card
-
-            card = send_approval_card(alert, snapshot, position)
-        elif guard["ok"]:
+        if guard["ok"]:
             from steve_trade_bot import auto_paper_buy
 
             auto_buy = auto_paper_buy(alert, snapshot)
@@ -324,7 +402,7 @@ def handle_option_entry(alert: dict[str, Any], send_approval: bool = True) -> di
         "position_id": position.get("position_id"),
         "shadow_position_created": created,
         "route": "auto_paper_buy" if auto_buy else "approval_required" if card else "not_sent",
-        "route_reason": "hedge" if is_hedge_alert(alert) else "auto_entry_guard" if card and not guard["ok"] else "",
+        "route_reason": "auto_entry_guard" if card and not guard["ok"] else "",
         "auto_entry_guard": guard,
         "approval_card": card or {},
         "auto_buy": auto_buy or {},
@@ -332,9 +410,89 @@ def handle_option_entry(alert: dict[str, Any], send_approval: bool = True) -> di
     }
 
 
+def matched_exit_contract_key(exit_alert: dict[str, Any], matched_position: dict[str, Any] | None = None) -> str:
+    if matched_position:
+        return alert_contract_key(matched_position)
+    return alert_contract_key(exit_alert)
+
+
+def canonical_option_exit_raw_key(exit_alert: dict[str, Any]) -> str:
+    time_bucket = alert_time_bucket(exit_alert)
+    if not time_bucket:
+        time_bucket = "raw:" + stable_hash([normalized_text_key(exit_alert.get("raw_text"))])[:12]
+    return "|".join(
+        [
+            "exit_raw",
+            alert_contract_key(exit_alert),
+            exit_price_key(exit_alert),
+            int_key(exit_alert.get("contracts")),
+            time_bucket,
+        ]
+    )
+
+
+def canonical_option_exit_key(
+    exit_alert: dict[str, Any],
+    matched_position: dict[str, Any] | None = None,
+    requested_contracts: int | None = None,
+) -> str:
+    time_bucket = alert_time_bucket(exit_alert)
+    if not time_bucket:
+        time_bucket = "raw:" + stable_hash([normalized_text_key(exit_alert.get("raw_text"))])[:12]
+    return "|".join(
+        [
+            "exit",
+            str((matched_position or {}).get("position_id") or ""),
+            matched_exit_contract_key(exit_alert, matched_position),
+            exit_price_key(exit_alert),
+            int_key(requested_contracts if requested_contracts is not None else exit_alert.get("contracts")),
+            time_bucket,
+        ]
+    )
+
+
+def steve_exit_unique_key(row: dict[str, Any]) -> str:
+    if row.get("canonical_exit_key"):
+        return str(row.get("canonical_exit_key"))
+    if row.get("canonical_raw_exit_key"):
+        return str(row.get("canonical_raw_exit_key"))
+    return "|".join(
+        [
+            "legacy_exit",
+            str(row.get("matched_shadow_position_id") or ""),
+            alert_contract_key(row),
+            exit_price_key(row),
+            int_key(row.get("contracts")),
+        ]
+    )
+
+
+def unique_steve_exit_rows(exit_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for row in exit_rows:
+        key = steve_exit_unique_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
+def existing_steve_exit_for_key(key: str) -> dict[str, Any] | None:
+    for row in read_jsonl(STEVE_EXITS_FILE):
+        if str(row.get("canonical_exit_key") or "") == key:
+            return row
+        if str(row.get("canonical_raw_exit_key") or "") == key:
+            return row
+        if steve_exit_unique_key(row) == key:
+            return row
+    return None
+
+
 def applied_exit_contracts(position_id: str, exit_rows: list[dict[str, Any]]) -> int:
     total = 0
-    for row in exit_rows:
+    for row in unique_steve_exit_rows(exit_rows):
         if row.get("matched_shadow_position_id") == position_id:
             total += int(row.get("contracts") or 0)
     return total
@@ -415,35 +573,47 @@ def match_shadow_position_for_exit(exit_alert: dict[str, Any]) -> dict[str, Any]
 
 
 def handle_option_exit(exit_alert: dict[str, Any]) -> dict[str, Any]:
-    exit_id = "exit-" + stable_hash(
-        [
-            exit_alert.get("source_dedupe_key"),
-            exit_alert.get("raw_text"),
-            exit_alert.get("exit_price"),
-            exit_alert.get("parsed_at"),
-        ]
-    )[:16]
-    if exit_id in existing_values(STEVE_EXITS_FILE, "exit_id"):
-        return {"event_type": "option_exit_validation_result", "exit_id": exit_id, "created": False}
+    raw_exit_key = canonical_option_exit_raw_key(exit_alert)
+    existing = existing_steve_exit_for_key(raw_exit_key)
+    if existing:
+        return {"event_type": "option_exit_validation_result", "exit_id": existing.get("exit_id"), "created": False}
     matched = match_shadow_position_for_exit(exit_alert)
     requested_contracts = int(exit_alert.get("contracts") or 0)
     if matched and requested_contracts <= 0:
         requested_contracts = int(matched.get("computed_remaining_contracts") or matched.get("contracts") or 0)
     if matched:
         requested_contracts = min(requested_contracts, int(matched.get("computed_remaining_contracts") or requested_contracts))
+    canonical_exit_key = canonical_option_exit_key(exit_alert, matched, requested_contracts)
+    existing = existing_steve_exit_for_key(canonical_exit_key)
+    if existing:
+        return {"event_type": "option_exit_validation_result", "exit_id": existing.get("exit_id"), "created": False}
+    exit_id = "exit-" + stable_hash([canonical_exit_key])[:16]
+    if exit_id in existing_values(STEVE_EXITS_FILE, "exit_id"):
+        return {"event_type": "option_exit_validation_result", "exit_id": exit_id, "created": False}
     record = {
         "event_type": "steve_option_exit",
         "exit_id": exit_id,
+        "canonical_exit_key": canonical_exit_key,
+        "canonical_raw_exit_key": raw_exit_key,
         "recorded_at": now_iso(),
         "source_dedupe_key": exit_alert.get("source_dedupe_key"),
         "ticker": exit_alert.get("ticker") or (matched or {}).get("ticker"),
-        "exit_price": float(exit_alert.get("exit_price")),
+        "contract_symbol": (matched or {}).get("contract_symbol"),
+        "exit_price": safe_float(exit_alert.get("exit_price")),
+        "exit_action": exit_alert.get("exit_action"),
         "contracts": requested_contracts,
         "matched_shadow_position_id": (matched or {}).get("position_id"),
         "match_confidence": "medium" if matched and exit_alert.get("ticker") else ("low" if matched else "none"),
         "raw_text": exit_alert.get("raw_text", ""),
     }
+    for key in ("expiration_date", "option_type", "strike_price"):
+        if (matched or {}).get(key) is not None:
+            record[key] = (matched or {}).get(key)
     for key in ("expiration_date", "option_type", "strike_price", "context_entry_price", "context_contracts"):
+        if key in {"expiration_date", "option_type", "strike_price"} and matched and matched.get(key) is not None:
+            if exit_alert.get(key) is not None and str(exit_alert.get(key)) != str(matched.get(key)):
+                record[f"parsed_{key}"] = exit_alert.get(key)
+            continue
         if exit_alert.get(key) is not None:
             record[key] = exit_alert.get(key)
     if matched and exit_alert.get("expiration_date") and exit_alert.get("strike_price"):
@@ -877,17 +1047,24 @@ def apply_steve_exit_to_human_positions(
         target_closed = min(position_contracts, steve_cumulative_closed)
         already_closed = human_exit_contracts(str(position.get("position_id")), human_exit_rows)
         quantity = target_closed - already_closed
+        exit_price = safe_float(exit_record.get("exit_price"))
+        exit_price_source = "steve_exit_alert"
+        if exit_price is None and exit_record.get("exit_action") == "stopped_out":
+            exit_price = stop_price_for_human_position(position)
+            exit_price_source = "local_stop_price_contextual_steve_stop"
+        if exit_price is None:
+            continue
         row = append_human_exit(
             position,
             quantity,
-            float(exit_record.get("exit_price")),
+            exit_price,
             "steve_exit_catch_up",
             f"steve_exit:{exit_record.get('exit_id')}",
             {
                 "steve_exit_id": exit_record.get("exit_id"),
                 "steve_cumulative_closed": steve_cumulative_closed,
                 "already_closed_before_exit": already_closed,
-                "exit_price_source": "steve_exit_alert",
+                "exit_price_source": exit_price_source,
             },
             human_exit_rows,
         )
@@ -1160,7 +1337,9 @@ def compute_steve_alert_pl_summary(
     """P/L from Steve's alert buy prices and Steve's explicit sell prices only."""
     target_day = day or date_key(now_iso())
     positions = positions if positions is not None else read_jsonl(SHADOW_POSITIONS_FILE)
-    exits = sorted(exits if exits is not None else read_jsonl(STEVE_EXITS_FILE), key=lambda row: str(row.get("recorded_at") or ""))
+    exits = unique_steve_exit_rows(
+        sorted(exits if exits is not None else read_jsonl(STEVE_EXITS_FILE), key=lambda row: str(row.get("recorded_at") or ""))
+    )
     snapshots = snapshots if snapshots is not None else read_jsonl(QUOTE_SNAPSHOTS_FILE) + tracking_state_snapshots()
     positions_by_id = {str(row.get("position_id")): row for row in positions if row.get("position_id")}
     closed_by_position: dict[str, int] = {}

@@ -4,8 +4,9 @@
 
 Entry routing:
 
-- `#hedge` option alerts: send Telegram approval card, no automatic paper buy.
-- Non-hedge option alerts such as `#swing`, `#lotto`, or no tag: create a local paper position, attempt Alpaca paper buy when enabled, and send an `AUTO PAPER BUY` Telegram report.
+- Fresh unambiguous option alerts, including `#hedge`, `#swing`, `#lotto`, or no tag: create a local paper position, attempt Alpaca paper buy when enabled and the paper market is open, and send an `AUTO PAPER BUY` Telegram report.
+- Guard-blocked or context-incomplete alerts: send an owner-DM Telegram approval card instead of immediate paper entry.
+- Stale alerts recovered from browser history after the laptop was asleep/off are audit evidence, not fresh entry triggers.
 
 Current local paper exit rules:
 
@@ -14,7 +15,7 @@ Current local paper exit rules:
 - `contracts>1`: sell `floor(total / 2)` at +80%, `floor(remaining / 2)` at +120%, and the rest at +200%.
 - Steve close alerts catch up only when Steve has closed more contracts than the local paper ledger already closed.
 
-Broker-side paper buy orders can be attempted through Alpaca when local paper submission is enabled. Broker-side paper sell orders are not yet wired as the source of truth; local JSONL ledgers are the validation source.
+Broker-side paper buy and sell orders can be attempted through Alpaca when local paper submission is enabled. Local JSONL ledgers remain the policy source of truth; broker-fill P/L is tracked separately so local policy, actual fills, and Steve-alert prices are not mixed.
 
 ## Key Trading Assumption
 
@@ -29,7 +30,7 @@ Use separate exit policies instead of one global ladder:
 - `fast_ladder`: keep the current +80%, +120%, +200% ladder. Use for 0DTE, 1DTE, lotto, and very short-dated contracts.
 - `hybrid_steve_runner`: take partial profit once, then let the rest follow Steve. Use for same-week swings where theta risk is still meaningful.
 - `steve_led`: hold for Steve close unless the hard stop or time stop fires. Use only for longer-dated swings with enough DTE and acceptable liquidity.
-- `shadow_only`: do not trade, only track outcomes. Use for hedges without portfolio exposure or unsupported edge cases.
+- `shadow_only`: do not trade, only track outcomes. Use for unsupported edge cases or future evidence showing a category should not auto-enter paper.
 
 Initial DTE split to validate:
 

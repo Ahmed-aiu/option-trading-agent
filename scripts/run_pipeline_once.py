@@ -5,17 +5,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from alpaca_paper_adapter import AdapterError, audit_record, load_adapter_config, order_payload_from_decision, write_order_audit
 from option_validation import handle_option_entry, handle_option_exit, is_option_entry, is_option_exit
 from parse_alert import ParseRejected, parse_trade_alert, rejected_record
-from pipeline_common import DATA_DIR, append_jsonl, load_seen_keys, now_iso, read_jsonl
+from pipeline_common import DATA_DIR, append_jsonl, load_seen_keys, now_iso, parse_datetime, read_jsonl
 from risk_guard import decision_for_alert, existing_decisions
 
 
 PROCESSED_FILE = DATA_DIR / "processed_notifications.jsonl"
+DEFAULT_MAX_RAW_ALERT_AGE_SECONDS = 120.0
 
 
 def normalize_parsed(value: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -53,6 +55,33 @@ def mark_processed(raw: dict[str, Any], status: str, parsed_count: int, decision
             "decision_count": decision_count,
         },
     )
+
+
+def max_raw_alert_age_seconds() -> float:
+    raw = os.environ.get("OPENCLAW_MAX_RAW_ALERT_AGE_SECONDS", "")
+    if not raw:
+        return DEFAULT_MAX_RAW_ALERT_AGE_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RAW_ALERT_AGE_SECONDS
+    return value if value > 0 else DEFAULT_MAX_RAW_ALERT_AGE_SECONDS
+
+
+def raw_alert_capture_age_seconds(raw: dict[str, Any]) -> float | None:
+    source_time = parse_datetime(raw.get("notification_timestamp"))
+    captured_time = parse_datetime(raw.get("captured_at"))
+    if source_time is None or captured_time is None:
+        return None
+    return (captured_time - source_time).total_seconds()
+
+
+def raw_alert_too_stale_to_route(raw: dict[str, Any]) -> tuple[bool, float | None, float]:
+    max_age = max_raw_alert_age_seconds()
+    age = raw_alert_capture_age_seconds(raw)
+    if age is None:
+        return False, None, max_age
+    return age > max_age, age, max_age
 
 
 def alpaca_dry_run_audit(decision: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
@@ -100,6 +129,24 @@ def process_raw_notifications(
             break
         counts["raw_new"] += 1
         processed_now += 1
+        stale, age_seconds, max_age_seconds = raw_alert_too_stale_to_route(raw)
+        if stale:
+            append_jsonl(
+                DATA_DIR / "rejected_alerts.jsonl",
+                {
+                    "event_type": "rejected_trade_alert",
+                    "rejected_at": now_iso(),
+                    "reason": "stale_raw_alert",
+                    "dedupe_key": key,
+                    "raw_text": raw.get("body", ""),
+                    "age_seconds": round(float(age_seconds or 0), 3),
+                    "max_age_seconds": max_age_seconds,
+                },
+            )
+            counts["stale_skipped"] = int(counts.get("stale_skipped") or 0) + 1
+            mark_processed(raw, "skipped:stale_raw_alert", 0, 0)
+            seen.add(str(key))
+            continue
         parsed_records: list[dict[str, Any]] = []
         decisions: list[dict[str, Any]] = []
         try:

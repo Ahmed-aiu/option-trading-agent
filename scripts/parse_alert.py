@@ -96,6 +96,7 @@ OPTION_EXIT_PRICE_RE = re.compile(
     rf"(?P<quantity>\d+)?\s*(?:@|at)\s*(?P<exit_price>{PRICE_VALUE_RE})",
     re.I,
 )
+OPTION_CONTEXT_STOP_RE = re.compile(r"\bstopped?\s+out\b", re.I)
 HASHTAG_RE = re.compile(r"#(?P<tag>[A-Za-z][A-Za-z0-9_-]*)")
 
 
@@ -250,10 +251,13 @@ def option_context_for_exit(
 
 def parse_option_exit(raw_text: str, record: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
     match = OPTION_EXIT_PRICE_RE.search(raw_text)
-    if not match:
+    stop_match = None if match else OPTION_CONTEXT_STOP_RE.search(raw_text)
+    if not match and not stop_match:
         return None
     source_key = record.get("dedupe_key") or record.get("source_dedupe_key") or ""
-    context = option_context_for_exit(raw_text, match.start(), record, config)
+    context = option_context_for_exit(raw_text, (match or stop_match).start(), record, config)
+    if stop_match and not context.get("ticker"):
+        return None
     exit_record = {
         "event_type": "parsed_trade_alert",
         "source_dedupe_key": source_key,
@@ -262,9 +266,9 @@ def parse_option_exit(raw_text: str, record: dict[str, Any], config: dict[str, A
         "side": "exit",
         "instrument_type": "option",
         "entry_type": "exit_candidate",
-        "exit_action": match.group("action").lower(),
-        "exit_price": float(match.group("exit_price")),
-        "contracts": int(match.group("quantity")) if match.group("quantity") else None,
+        "exit_action": match.group("action").lower() if match else "stopped_out",
+        "exit_price": float(match.group("exit_price")) if match else None,
+        "contracts": int(match.group("quantity")) if match and match.group("quantity") else None,
         "entry_price": None,
         "stop_price": None,
         "target_price": None,

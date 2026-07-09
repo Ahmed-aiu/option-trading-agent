@@ -7,7 +7,9 @@ import argparse
 import datetime as dt
 import gzip
 import json
+import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -178,8 +180,7 @@ def browser_health_is_interesting(row: dict[str, Any]) -> bool:
         return True
     if row.get("errors"):
         return True
-    totals = row.get("totals") or {}
-    return any(int(totals.get(key) or 0) > 0 for key in ("messages_new", "raw_backfilled", "raw_processed"))
+    return False
 
 
 def file_stats(path: Path) -> dict[str, Any]:
@@ -340,11 +341,15 @@ def archive_original(path: Path, archive_dir: Path) -> Path | None:
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def compact_option_snapshots(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:

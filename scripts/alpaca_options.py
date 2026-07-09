@@ -4,21 +4,25 @@
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import json
 import os
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 from alpaca_paper_adapter import AdapterError, alpaca_request, load_adapter_config, require_paper_environment
-from pipeline_common import DATA_DIR, append_jsonl, now_iso, parse_datetime, stable_hash
+from pipeline_common import DATA_DIR, append_jsonl, now_iso, parse_datetime, read_jsonl, stable_hash
 
 
 DATA_HOST = "https://data.alpaca.markets"
 DEFAULT_STOCK_FEED = "iex"
 DEFAULT_OPTION_FEED = "indicative"
+ORDERS_FILE = DATA_DIR / "orders_paper.jsonl"
+ORDER_LOCK_FILE = DATA_DIR / ".orders_paper.lock"
 
 
 class AlpacaDataError(Exception):
@@ -408,20 +412,29 @@ def option_exit_order_client_id(position: dict[str, Any], contracts: int, trigge
     return f"openclaw-opt-exit-{stable_hash([position.get('position_id'), position.get('contract_symbol'), contracts, trigger_key])[:19]}"[:48]
 
 
+def normalized_limit_price(value: Any) -> str:
+    try:
+        price = Decimal(str(value))
+    except Exception as exc:  # noqa: BLE001
+        raise AdapterError("Option order missing positive entry_price") from exc
+    if price <= 0:
+        raise AdapterError("Option order missing positive entry_price")
+    return str(price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def build_option_order_payload(position: dict[str, Any]) -> dict[str, Any]:
     qty = int(position.get("contracts") or 0)
     if qty <= 0:
         raise AdapterError("Option order qty must be a positive whole number")
     limit_price = position.get("entry_price")
-    if limit_price is None or float(limit_price) <= 0:
-        raise AdapterError("Option order missing positive entry_price")
+    limit_price_text = normalized_limit_price(limit_price)
     return {
         "symbol": position["contract_symbol"],
         "side": "buy",
         "type": "limit",
         "time_in_force": "day",
         "qty": str(qty),
-        "limit_price": str(limit_price),
+        "limit_price": limit_price_text,
         "client_order_id": option_order_client_id(str(position.get("source_dedupe_key") or position.get("position_id")), position["contract_symbol"]),
     }
 
@@ -453,48 +466,90 @@ def options_market_open(env: dict[str, str]) -> tuple[bool, str]:
     return False, "options_market_closed"
 
 
+@contextmanager
+def order_audit_lock() -> Any:
+    ORDER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with ORDER_LOCK_FILE.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def existing_order_audit(action: str, client_order_id: str) -> dict[str, Any] | None:
+    fallback: dict[str, Any] | None = None
+    for row in reversed(list(read_jsonl(ORDERS_FILE))):
+        payload = row.get("payload") or {}
+        if row.get("action") == action and str(payload.get("client_order_id") or "") == client_order_id:
+            if str(row.get("status") or "").lower() != "blocked":
+                return row
+            fallback = fallback or row
+    return fallback
+
+
 def submit_option_paper_order(position: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] | None = None
-    try:
-        config, env_file = load_adapter_config()
-        env = require_paper_environment(config, env_file, require_keys=True)
-        payload = build_option_order_payload(position)
-        is_open, market_reason = options_market_open(env)
-        if not is_open:
-            raise AdapterError(market_reason)
-        if not env.get("submit_enabled"):
-            raise AdapterError("paper_order_submission_disabled")
-        status, response, headers = alpaca_request("POST", "/v2/orders", env, payload)
-        response["_http_status"] = status
-        if headers.get("x-request-id"):
-            response["_x_request_id"] = headers["x-request-id"]
-        audit = option_order_audit(position, payload, response, "submitted")
-    except Exception as exc:  # noqa: BLE001
-        audit = option_order_audit(position, payload, None, "blocked", str(exc))
-    append_jsonl(DATA_DIR / "orders_paper.jsonl", audit)
-    return audit
+    with order_audit_lock():
+        try:
+            config, env_file = load_adapter_config()
+            env = require_paper_environment(config, env_file, require_keys=True)
+            payload = build_option_order_payload(position)
+            existing = existing_order_audit("paper_entry_order", str(payload.get("client_order_id") or ""))
+            if existing is not None:
+                return {
+                    **existing,
+                    "recorded_at": now_iso(),
+                    "status": "skipped",
+                    "reason": "duplicate_client_order_id_already_audited",
+                    "duplicate_of_recorded_at": existing.get("recorded_at"),
+                }
+            is_open, market_reason = options_market_open(env)
+            if not is_open:
+                raise AdapterError(market_reason)
+            if not env.get("submit_enabled"):
+                raise AdapterError("paper_order_submission_disabled")
+            status, response, headers = alpaca_request("POST", "/v2/orders", env, payload)
+            response["_http_status"] = status
+            if headers.get("x-request-id"):
+                response["_x_request_id"] = headers["x-request-id"]
+            audit = option_order_audit(position, payload, response, "submitted")
+        except Exception as exc:  # noqa: BLE001
+            audit = option_order_audit(position, payload, None, "blocked", str(exc))
+        append_jsonl(ORDERS_FILE, audit)
+        return audit
 
 
 def submit_option_paper_sell_order(position: dict[str, Any], contracts: int, reason: str, trigger_key: str) -> dict[str, Any]:
     payload: dict[str, Any] | None = None
-    try:
-        config, env_file = load_adapter_config()
-        env = require_paper_environment(config, env_file, require_keys=True)
-        payload = build_option_sell_order_payload(position, contracts, trigger_key)
-        is_open, market_reason = options_market_open(env)
-        if not is_open:
-            raise AdapterError(market_reason)
-        if not env.get("submit_enabled"):
-            raise AdapterError("paper_order_submission_disabled")
-        status, response, headers = alpaca_request("POST", "/v2/orders", env, payload)
-        response["_http_status"] = status
-        if headers.get("x-request-id"):
-            response["_x_request_id"] = headers["x-request-id"]
-        audit = option_order_audit(position, payload, response, "submitted", action="paper_exit_order", exit_reason=reason)
-    except Exception as exc:  # noqa: BLE001
-        audit = option_order_audit(position, payload, None, "blocked", str(exc), action="paper_exit_order", exit_reason=reason)
-    append_jsonl(DATA_DIR / "orders_paper.jsonl", audit)
-    return audit
+    with order_audit_lock():
+        try:
+            config, env_file = load_adapter_config()
+            env = require_paper_environment(config, env_file, require_keys=True)
+            payload = build_option_sell_order_payload(position, contracts, trigger_key)
+            existing = existing_order_audit("paper_exit_order", str(payload.get("client_order_id") or ""))
+            if existing is not None:
+                return {
+                    **existing,
+                    "recorded_at": now_iso(),
+                    "status": "skipped",
+                    "reason": "duplicate_client_order_id_already_audited",
+                    "duplicate_of_recorded_at": existing.get("recorded_at"),
+                }
+            is_open, market_reason = options_market_open(env)
+            if not is_open:
+                raise AdapterError(market_reason)
+            if not env.get("submit_enabled"):
+                raise AdapterError("paper_order_submission_disabled")
+            status, response, headers = alpaca_request("POST", "/v2/orders", env, payload)
+            response["_http_status"] = status
+            if headers.get("x-request-id"):
+                response["_x_request_id"] = headers["x-request-id"]
+            audit = option_order_audit(position, payload, response, "submitted", action="paper_exit_order", exit_reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            audit = option_order_audit(position, payload, None, "blocked", str(exc), action="paper_exit_order", exit_reason=reason)
+        append_jsonl(ORDERS_FILE, audit)
+        return audit
 
 
 def option_order_audit(

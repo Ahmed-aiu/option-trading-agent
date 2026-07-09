@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import signal
 import subprocess
@@ -81,12 +82,27 @@ end run
 
 VISIBLE_MESSAGES_JS = r'''
 (() => {
+  const scrollableAncestor = (node) => {
+    let current = node;
+    while (current) {
+      if (current.scrollHeight > current.clientHeight + 16) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+    return null;
+  };
   const selectors = [
     '[id^="chat-messages-"]',
     '[data-list-item-id*="chat-messages"]',
     'li[class*="messageListItem"]',
     'div[class*="messageListItem"]'
   ];
+  const initialNodes = Array.from(document.querySelectorAll(selectors.join(',')));
+  const scroller = scrollableAncestor(initialNodes[initialNodes.length - 1] || document.querySelector('[role="log"]'));
+  if (scroller) {
+    scroller.scrollTop = scroller.scrollHeight;
+  }
   const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
   const messages = nodes.map((el) => {
     const text = (el.innerText || el.textContent || '')
@@ -131,7 +147,7 @@ def in_market_window(tz_name: str) -> bool:
 
 def write_latest_json(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     tmp_path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     tmp_path.replace(path)
 
@@ -210,7 +226,15 @@ def save_state(state: dict[str, Any]) -> None:
 
 
 def message_key(channel_id: str, message: dict[str, Any]) -> str:
-    return str(message.get("id") or stable_hash([channel_id, message.get("text")])[:28])
+    raw_id = str(message.get("id") or "")
+    id_matches = re.findall(r"chat-messages-\d+-\d+", raw_id)
+    if id_matches:
+        return id_matches[-1]
+    return raw_id or stable_hash([channel_id, message.get("text")])[:28]
+
+
+def message_fingerprint(message: dict[str, Any]) -> str:
+    return stable_hash([str(message.get("text") or "")])[:24]
 
 
 def detect_author(text: str, author_names: list[str]) -> str:
@@ -294,6 +318,48 @@ def filter_candidate_messages(
     return candidates
 
 
+def include_changed_seen_messages(
+    channel_id: str,
+    candidates: list[dict[str, Any]],
+    visible_messages: list[dict[str, Any]],
+    state: dict[str, Any],
+    author_names: list[str],
+    tz_name: str,
+) -> list[dict[str, Any]]:
+    """Keep the normal age window, but do not miss late edits to seen messages."""
+    selected_keys = {message_key(channel_id, message) for message in candidates}
+    seen_fingerprints = {
+        str(key): str(value)
+        for key, value in (state.get("seen_message_fingerprints") or {}).items()
+        if key and value
+    }
+    if not seen_fingerprints:
+        return candidates
+
+    expanded = list(candidates)
+    current_author = ""
+    for message in visible_messages:
+        key = message_key(channel_id, message)
+        if key in selected_keys or key not in seen_fingerprints:
+            continue
+        fingerprint = message_fingerprint(message)
+        if seen_fingerprints.get(key) == fingerprint:
+            continue
+        text = str(message.get("text") or "")
+        detected_author = detect_author(text, author_names)
+        if detected_author:
+            current_author = detected_author
+        if not detected_author and not current_author:
+            continue
+        copy = dict(message)
+        copy["detected_author"] = detected_author or current_author
+        timestamp = extract_message_timestamp(text, tz_name)
+        copy["message_timestamp"] = timestamp.isoformat(timespec="seconds") if timestamp else ""
+        expanded.append(copy)
+        selected_keys.add(key)
+    return expanded
+
+
 def append_browser_message(
     channel_id: str,
     channel_url: str,
@@ -319,6 +385,40 @@ def append_browser_message(
     )
 
 
+def browser_health_history_record(record: dict[str, Any]) -> dict[str, Any]:
+    channels: list[dict[str, Any]] = []
+    for channel in list(record.get("channels") or []):
+        if not isinstance(channel, dict):
+            continue
+        channels.append(
+            {
+                "channel_id": channel.get("channel_id"),
+                "status": channel.get("status"),
+                "reason": channel.get("reason"),
+                "candidate_messages": channel.get("candidate_messages"),
+                "messages_new": channel.get("messages_new"),
+                "raw_backfilled": channel.get("raw_backfilled"),
+                "raw_processed": channel.get("raw_processed"),
+            }
+        )
+    return {
+        "event_type": record.get("event_type"),
+        "recorded_at": record.get("recorded_at"),
+        "mode": record.get("mode"),
+        "status": record.get("status"),
+        "errors": record.get("errors") or [],
+        "totals": {
+            "channels": (record.get("totals") or {}).get("channels"),
+            "channels_ok": (record.get("totals") or {}).get("channels_ok"),
+            "candidate_messages": (record.get("totals") or {}).get("candidate_messages"),
+            "messages_new": (record.get("totals") or {}).get("messages_new"),
+            "raw_backfilled": (record.get("totals") or {}).get("raw_backfilled"),
+            "raw_processed": (record.get("totals") or {}).get("raw_processed"),
+        },
+        "channels": channels,
+    }
+
+
 def process_browser_messages(
     channel_id: str,
     channel_url: str,
@@ -337,14 +437,22 @@ def process_browser_messages(
         "raw_processed": 0,
     }
     source = f"{source_prefix}:{channel_id}"
+    seen_fingerprints = {
+        str(key): str(value)
+        for key, value in (state.get("seen_message_fingerprints") or {}).items()
+        if key and value
+    }
     for message in messages:
         key = message_key(channel_id, message)
-        if key in seen:
+        fingerprint = message_fingerprint(message)
+        if key in seen and seen_fingerprints.get(key) == fingerprint:
             continue
         records = build_raw_records(
             str(message.get("text") or ""),
             source,
             dedupe_scope=key,
+            suppress_context_entries=True,
+            source_time=str(message.get("message_timestamp") or ""),
         )
         if mode != "mark":
             append_browser_message(channel_id, channel_url, message, records, mode)
@@ -357,7 +465,9 @@ def process_browser_messages(
                     raw_seen.add(raw_key)
                     counts["raw_backfilled"] += 1
         seen.add(key)
+        seen_fingerprints[key] = fingerprint
     state["seen_message_keys"] = sorted(seen)
+    state["seen_message_fingerprints"] = dict(sorted(seen_fingerprints.items()))
     save_state(state)
     if mode == "live" and process_raw and counts["raw_backfilled"]:
         before = len(read_jsonl(DATA_DIR / "raw_notifications.jsonl"))
@@ -418,6 +528,14 @@ def capture_once(
                 tz_name=tz_name,
                 allow_unknown_time=allow_unknown_time,
             )
+            candidates = include_changed_seen_messages(
+                channel_id,
+                candidates,
+                visible,
+                load_state(),
+                author_names=author_names,
+                tz_name=tz_name,
+            )
             counts = process_browser_messages(
                 channel_id,
                 channel_url,
@@ -451,7 +569,7 @@ def capture_once(
         record["status"] = "degraded" if record["totals"]["channels_ok"] else "failed"
     record["history_appended"] = append_jsonl_if_changed(
         BROWSER_HEALTH_FILE,
-        record,
+        browser_health_history_record(record),
         ignore_keys=HEALTH_HISTORY_IGNORE_KEYS,
         always_append=browser_health_is_interesting(record),
     )
