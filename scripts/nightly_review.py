@@ -38,6 +38,7 @@ STEVE_EXITS_FILE = DATA_DIR / "steve_option_exits.jsonl"
 PIPELINE_HEALTH_FILE = DATA_DIR / "pipeline_health_checks.jsonl"
 DAILY_PL_FILE = DATA_DIR / "daily_pl_reports.jsonl"
 BROWSER_HEALTH_LATEST_FILE = DATA_DIR / "discord_browser_health_latest.json"
+PREMARKET_READINESS_FILE = DATA_DIR / "premarket_readiness_reports.jsonl"
 
 PRICE_RE = r"(?:\d+(?:\.\d+)?|\.\d+)"
 ADD_RE = re.compile(r"\b(?P<action>aaded|added|add)\s+(?P<contracts>\d+)\s+(?:@|at)\s*(?P<price>" + PRICE_RE + r")", re.I)
@@ -51,6 +52,9 @@ SYNTHETIC_TEST_VALUES = {
     "manual-dm-close-report-test",
     "source-test",
 }
+SLOW_ORDER_SUBMISSION_SECONDS = 90.0
+STARTUP_BACKFILL_SOURCE_CAPTURE_SECONDS = 300.0
+STARTUP_BACKFILL_CAPTURE_ORDER_SECONDS = 120.0
 
 
 def safe_float(value: Any) -> float | None:
@@ -711,14 +715,12 @@ def parsed_source_keys(rows: list[dict[str, Any]]) -> list[str]:
     return keys
 
 
-def truth_buy_pipeline_evidence(
+def raw_matches_for_truth_buy(
     event: dict[str, Any],
     raw_rows: list[dict[str, Any]],
-    rejected_rows: list[dict[str, Any]],
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     buy_key = event_key(event)
     raw_matches: list[dict[str, Any]] = []
-    rejected_matches: list[dict[str, Any]] = []
     for raw in raw_rows:
         for parsed in parsed_for_body(
             str(raw.get("raw_text") or raw_text_from_record(raw)),
@@ -730,6 +732,16 @@ def truth_buy_pipeline_evidence(
             if parsed_buy_key(parsed) == buy_key:
                 raw_matches.append(raw)
                 break
+    return raw_matches
+
+
+def truth_buy_pipeline_evidence(
+    event: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    rejected_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    raw_matches = raw_matches_for_truth_buy(event, raw_rows)
+    rejected_matches: list[dict[str, Any]] = []
     raw_keys = {
         str(row.get("dedupe_key") or row.get("source_dedupe_key") or "")
         for row in raw_matches
@@ -799,12 +811,186 @@ def first_time(rows: list[dict[str, Any]]) -> str:
     return min(values) if values else ""
 
 
+def first_row_by_time(rows: list[dict[str, Any]], tz_name: str) -> dict[str, Any] | None:
+    valid: list[tuple[dt.datetime, dict[str, Any]]] = []
+    fallback: list[dict[str, Any]] = []
+    for row in rows:
+        value = row_time(row)
+        if not value:
+            continue
+        parsed = parse_datetime(value, tz_name)
+        if parsed is None:
+            fallback.append(row)
+        else:
+            valid.append((parsed, row))
+    if valid:
+        return min(valid, key=lambda item: item[0])[1]
+    return min(fallback, key=row_time) if fallback else None
+
+
 def latency_seconds(start: Any, end: Any, tz_name: str) -> float | None:
     start_dt = parse_datetime(start, tz_name)
     end_dt = parse_datetime(end, tz_name)
     if start_dt is None or end_dt is None:
         return None
     return (end_dt - start_dt).total_seconds()
+
+
+def normalized_latency_seconds(start: Any, end: Any, tz_name: str) -> float | None:
+    seconds = latency_seconds(start, end, tz_name)
+    if seconds is not None and seconds < 0 and seconds >= -300:
+        return 0.0
+    return seconds
+
+
+def rounded_seconds(value: float | None) -> float | None:
+    return round(value, 1) if value is not None else None
+
+
+def first_raw_capture_match(raw_matches: list[dict[str, Any]], tz_name: str) -> dict[str, Any] | None:
+    valid: list[tuple[dt.datetime, dict[str, Any]]] = []
+    fallback: list[dict[str, Any]] = []
+    for row in raw_matches:
+        captured_at = str(row.get("captured_at") or "")
+        if not captured_at:
+            continue
+        parsed = parse_datetime(captured_at, tz_name)
+        if parsed is None:
+            fallback.append(row)
+        else:
+            valid.append((parsed, row))
+    if valid:
+        return min(valid, key=lambda item: item[0])[1]
+    return min(fallback, key=lambda row: str(row.get("captured_at") or "")) if fallback else None
+
+
+def source_label_for_raw(row: dict[str, Any]) -> str:
+    raw_payload = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    return str(raw_payload.get("source") or row.get("subtitle") or row.get("source_app") or "")
+
+
+def contract_identity(row: dict[str, Any]) -> dict[str, Any]:
+    fields = option_fields(row)
+    return {
+        "ticker": fields.get("ticker"),
+        "expiration_date": fields.get("expiration_date"),
+        "strike_price": fields.get("strike_price"),
+        "option_type": option_side(fields.get("option_type")),
+        "contract_key": contract_key(row),
+    }
+
+
+def late_order_latency_evidence(
+    event: dict[str, Any],
+    order: dict[str, Any],
+    raw_matches: list[dict[str, Any]],
+    parsed_keys: list[str],
+    tz_name: str,
+) -> dict[str, Any]:
+    source_time = str(event.get("source_time") or "")
+    order_time = row_time(order)
+    raw_match = first_raw_capture_match(raw_matches, tz_name)
+    raw_captured_at = str((raw_match or {}).get("captured_at") or "")
+    total_seconds = normalized_latency_seconds(source_time, order_time, tz_name)
+    source_to_capture_seconds = (
+        normalized_latency_seconds(source_time, raw_captured_at, tz_name)
+        if raw_captured_at
+        else None
+    )
+    capture_to_order_seconds = (
+        normalized_latency_seconds(raw_captured_at, order_time, tz_name)
+        if raw_captured_at
+        else None
+    )
+    raw_dedupe_keys = sorted(
+        {
+            str(row.get("dedupe_key") or "")
+            for row in raw_matches
+            if row.get("dedupe_key")
+        }
+    )
+    raw_source_dedupe_keys = sorted(
+        {
+            str(row.get("source_dedupe_key") or "")
+            for row in raw_matches
+            if row.get("source_dedupe_key")
+        }
+    )
+    raw_sources = sorted({source_label_for_raw(row) for row in raw_matches if source_label_for_raw(row)})
+    return {
+        "event": event,
+        "contract": contract_identity(event),
+        "event_key": event.get("event_key") or event_key(event),
+        "contract_key": event.get("contract_key") or contract_key(event),
+        "source": event.get("source"),
+        "channel_id": event.get("channel_id"),
+        "message_key": event.get("message_key"),
+        "source_time": source_time or None,
+        "raw_captured_at": raw_captured_at or None,
+        "order_time": order_time or None,
+        "source_to_capture_seconds": rounded_seconds(source_to_capture_seconds),
+        "capture_to_order_seconds": rounded_seconds(capture_to_order_seconds),
+        "total_latency_seconds": rounded_seconds(total_seconds),
+        "latency_seconds": rounded_seconds(total_seconds),
+        "raw_match_count": len(raw_matches),
+        "raw_dedupe_keys": raw_dedupe_keys,
+        "raw_source_dedupe_keys": raw_source_dedupe_keys,
+        "raw_sources": raw_sources,
+        "selected_raw_dedupe_key": (raw_match or {}).get("dedupe_key"),
+        "selected_raw_source_dedupe_key": (raw_match or {}).get("source_dedupe_key"),
+        "parsed_source_keys": parsed_keys,
+        "order_source_dedupe_key": order.get("source_dedupe_key"),
+        "order_position_id": order.get("position_id"),
+        "order_id": order_response_id(order),
+        "order_status": order.get("status"),
+        "order_action": order.get("action"),
+        "order_side": order_payload_side(order),
+    }
+
+
+def late_order_issue(
+    event: dict[str, Any],
+    order: dict[str, Any],
+    raw_matches: list[dict[str, Any]],
+    parsed_keys: list[str],
+    tz_name: str,
+) -> dict[str, Any] | None:
+    evidence = late_order_latency_evidence(event, order, raw_matches, parsed_keys, tz_name)
+    total_seconds = safe_float(evidence.get("total_latency_seconds"))
+    if total_seconds is None or total_seconds <= SLOW_ORDER_SUBMISSION_SECONDS:
+        return None
+    severity = "warning" if total_seconds <= 300 else "critical"
+    source_to_capture_seconds = safe_float(evidence.get("source_to_capture_seconds"))
+    capture_to_order_seconds = safe_float(evidence.get("capture_to_order_seconds"))
+    if (
+        source_to_capture_seconds is not None
+        and capture_to_order_seconds is not None
+        and source_to_capture_seconds >= STARTUP_BACKFILL_SOURCE_CAPTURE_SECONDS
+        and capture_to_order_seconds <= STARTUP_BACKFILL_CAPTURE_ORDER_SECONDS
+    ):
+        return issue(
+            severity,
+            "machine_unavailable_startup_backfill",
+            "Paper order was late because the raw alert was captured long after Steve's source message, then ordered quickly after capture.",
+            evidence,
+            "Treat this as machine availability/startup backfill latency; add or verify premarket readiness instead of tuning parser or broker submission speed.",
+        )
+    return issue(
+        severity,
+        "slow_order_submission",
+        "Paper order was submitted too long after Steve's alert.",
+        evidence,
+        "Measure live capture, enrichment, and broker-submit latency; keep max-buy-latency and price-buffer rules focused on true live delays.",
+    )
+
+
+def latency_classification_summary(issues: list[dict[str, Any]]) -> dict[str, Any]:
+    machine_count = sum(1 for item in issues if item.get("code") == "machine_unavailable_startup_backfill")
+    slow_count = sum(1 for item in issues if item.get("code") == "slow_order_submission")
+    return {
+        "machine_unavailable_startup_backfill": machine_count,
+        "slow_order_submission": slow_count,
+    }
 
 
 def find_orders_for_position(position: dict[str, Any], orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1049,10 +1235,43 @@ def storage_hygiene_issue(scorecard: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
+def premarket_readiness_issue(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not reports:
+        return None
+    latest = reports[-1]
+    status = str(latest.get("status") or "")
+    if status == "ok":
+        return None
+    checks = [
+        {
+            "name": row.get("name"),
+            "status": row.get("status"),
+            "summary": row.get("summary"),
+            "recommendation": row.get("recommendation"),
+        }
+        for row in (latest.get("checks") or [])
+        if row.get("status") != "ok"
+    ]
+    return issue(
+        "critical" if status == "failed" else "warning",
+        "premarket_readiness_failed",
+        "Premarket readiness check did not pass before the session.",
+        {
+            "status": status,
+            "generated_at": latest.get("generated_at"),
+            "checks": checks[:8],
+            "recommendations": list(latest.get("recommendations") or [])[:8],
+        },
+        "Run `python3 scripts/premarket_readiness.py --print-json` before market open and resolve failed checks before relying on live paper entries.",
+    )
+
+
 def recursive_improvement_plan(issues: list[dict[str, Any]], report: dict[str, Any]) -> list[dict[str, Any]]:
     auto_fixable_codes = {
         "entry_price_worse_than_alert",
         "slow_order_submission",
+        "machine_unavailable_startup_backfill",
+        "premarket_readiness_failed",
         "local_position_without_broker_fill",
         "submitted_broker_order_unresolved",
         "local_pnl_differs_from_broker_fills",
@@ -1145,6 +1364,7 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
     filtered_counts["auto_buy_reports"] = sum(1 for row in auto_buy_reports if is_synthetic_test_row(row))
     auto_buy_reports = [row for row in auto_buy_reports if not is_synthetic_test_row(row)]
     health_checks = rows_for_day(PIPELINE_HEALTH_FILE, day, tz_name)
+    premarket_readiness_reports = rows_for_day(PREMARKET_READINESS_FILE, day, tz_name)
     capture_scorecard = capture_method_scorecard(truth_events, raw_rows, tz_name)
 
     buys_by_key = group_by_key(parsed_buys, parsed_buy_key)
@@ -1331,18 +1551,17 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
         if filled_buys:
             broker_filled_buys += 1
         if related_orders:
-            order_time = first_time(related_orders)
-            seconds = latency_seconds(event.get("source_time"), order_time, tz_name)
-            if seconds is not None and seconds > 90:
-                issues.append(
-                    issue(
-                        "warning" if seconds <= 300 else "critical",
-                        "slow_order_submission",
-                        "Paper order was submitted too long after Steve's alert.",
-                        {"event": event, "order_time": order_time, "latency_seconds": round(seconds, 1)},
-                        "Measure capture and enrichment latency; consider max-buy-latency and price-buffer rules when late.",
-                    )
+            first_order = first_row_by_time(related_orders, tz_name)
+            if first_order:
+                latency_issue = late_order_issue(
+                    event,
+                    first_order,
+                    raw_matches_for_truth_buy(event, raw_rows),
+                    parsed_keys,
+                    tz_name,
                 )
+                if latency_issue:
+                    issues.append(latency_issue)
         for position in contract_positions:
             alert_price = safe_float(event.get("entry_price"))
             entry_price = safe_float(position.get("entry_price"))
@@ -1571,10 +1790,14 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
     storage_issue = storage_hygiene_issue(storage_hygiene)
     if storage_issue:
         issues.append(storage_issue)
+    readiness_issue = premarket_readiness_issue(premarket_readiness_reports)
+    if readiness_issue:
+        issues.append(readiness_issue)
 
     severities = defaultdict(int)
     for item in issues:
         severities[str(item.get("severity") or "warning")] += 1
+    latency_summary = latency_classification_summary(issues)
 
     report = {
         "event_type": "nightly_pipeline_review",
@@ -1600,7 +1823,12 @@ def review_day(day: str, refresh_browser: bool = False, tz_name: str = "America/
             "broker_status_reports": len(broker_reports),
             "rejected": len(rejected),
             "filtered_test_artifacts": sum(filtered_counts.values()),
+            "machine_availability_findings": latency_summary["machine_unavailable_startup_backfill"],
+            "slow_order_submission_findings": latency_summary["slow_order_submission"],
+            "premarket_readiness_reports": len(premarket_readiness_reports),
         },
+        "premarket_readiness": premarket_readiness_reports[-1] if premarket_readiness_reports else {},
+        "latency_classification_counts": latency_summary,
         "issue_counts": dict(severities),
         "issues": issues,
         "capture_method_scorecard": capture_scorecard,
@@ -1627,6 +1855,8 @@ def recommended_next_actions(issues: list[dict[str, Any]]) -> list[str]:
         "duplicate_shadow_position_all_time",
         "duplicate_steve_exit_all_time",
         "browser_foreground_recovery_needed",
+        "machine_unavailable_startup_backfill",
+        "premarket_readiness_failed",
         "scale_in_not_supported",
         "contextual_stop_not_executed",
         "truth_buy_not_parsed",
@@ -1831,6 +2061,8 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- Steve truth: {counts.get('truth_buys', 0)} buys, {counts.get('truth_exits', 0)} exits, {counts.get('truth_adds', 0)} adds, {counts.get('truth_context_stops', 0)} context stops",
         f"- Pipeline: {counts.get('matched_buys', 0)}/{counts.get('truth_buys', 0)} buys parsed, {counts.get('paper_entries', 0)} paper entries, {counts.get('broker_filled_buys', 0)} broker buy fills",
         f"- Issues: {report.get('issue_counts') or {}}",
+        f"- Latency classifications: startup_backfill={counts.get('machine_availability_findings', 0)}, slow_order={counts.get('slow_order_submission_findings', 0)}",
+        f"- Premarket readiness reports: {counts.get('premarket_readiness_reports', 0)}",
         f"- Capture recommendation: {capture_reco.get('recommended_primary', 'n/a')} ({capture_reco.get('reason', 'n/a')})",
         "",
         "## Steve Truth Timeline",
@@ -1918,6 +2150,8 @@ def write_report(report: dict[str, Any]) -> tuple[Path, Path]:
             "json_path": str(json_path),
             "markdown_path": str(md_path),
             "counts": report.get("counts"),
+            "premarket_readiness": report.get("premarket_readiness"),
+            "latency_classification_counts": report.get("latency_classification_counts"),
             "issue_counts": report.get("issue_counts"),
             "capture_method_scorecard": report.get("capture_method_scorecard"),
             "all_time_pl": report.get("all_time_pl"),

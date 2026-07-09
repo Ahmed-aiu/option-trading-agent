@@ -39,10 +39,13 @@ Every weekday after market close:
    - `orders_paper.jsonl`
    - `broker_order_status_reports.jsonl`
    - `pipeline_health_checks.jsonl`
+   - `premarket_readiness_reports.jsonl`
    - `daily_pl_reports.jsonl`
    - `steve_alert_pl_reports.jsonl`
    - `broker_fill_pl_reports.jsonl`
    - `data_hygiene_reports.jsonl`
+   - `log_hygiene_reports.jsonl`
+   - `ledger_schema_reports.jsonl`
 5. Classify each issue by root cause, not symptom.
 6. Build an evidence-driven improvement plan: observed facts, hypotheses, missing data, instrumentation to add, candidate experiments, validation, and rollback criteria.
 7. Apply only changes that are justified by the evidence and safe for tomorrow's paper-only session. Prefer adding observability before changing behavior when the root cause is uncertain.

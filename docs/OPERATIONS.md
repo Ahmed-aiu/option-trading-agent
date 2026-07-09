@@ -64,6 +64,27 @@ tail -n 20 data/live_pipeline_heartbeats.jsonl
 
 If the heartbeat was fresh but `data/raw_notifications.jsonl` has no matching Discord row, the miss happened before parsing/Telegram, usually because Discord/macOS did not emit or persist a notification body for the channel message.
 
+## Premarket Readiness
+
+Before market open, run:
+
+```sh
+python3 scripts/premarket_readiness.py --print-json
+```
+
+The readiness check verifies the live pipeline heartbeat, browser capture health, disk free space, local watcher config presence, owner Telegram bot config presence, and the Alpaca paper endpoint guard. It writes:
+
+```text
+data/premarket_readiness_reports.jsonl
+data/premarket_readiness_latest.json
+```
+
+By default it sends the status only to the owner operational Telegram destination, never the executive group. Use `--no-telegram` for a local dry run. Useful thresholds:
+
+```sh
+python3 scripts/premarket_readiness.py --no-telegram --max-heartbeat-age-seconds 120 --max-browser-health-age-seconds 180 --min-free-gb 2
+```
+
 ## Backfill Missed Discord Text
 
 When Steve messages are visible in Discord but were missed by macOS notifications, paste the copied Discord text into the audit backfill path:
@@ -280,6 +301,36 @@ python3 scripts/data_hygiene.py scorecard --print-json
 python3 scripts/data_hygiene.py compact --print-json --min-saved-bytes 262144
 python3 scripts/data_hygiene.py compact --apply --print-json --min-saved-bytes 262144
 ```
+
+Log hygiene is separate from trading-ledger compaction. It is dry-run by default and archives before truncating active log files:
+
+```sh
+python3 scripts/log_hygiene.py --print-json
+python3 scripts/log_hygiene.py --apply --print-json --min-size-bytes 10485760
+```
+
+It writes:
+
+```text
+data/log_hygiene_reports.jsonl
+data/log_hygiene_latest.json
+```
+
+## Ledger Schema Check
+
+Use the schema checker when adding or changing ledger fields so future humans and LLMs can keep tracing alerts end to end:
+
+```sh
+python3 scripts/ledger_schema_check.py --data-dir data --print-json
+```
+
+To append a report for later nightly/recursive review:
+
+```sh
+python3 scripts/ledger_schema_check.py --data-dir data --print-json --write-report
+```
+
+See `docs/LEDGER_SCHEMAS.md` for the expected fields and join keys. The checker reports counts and missing field names, not raw Discord text or secrets.
 
 ## Clean Test Session
 
